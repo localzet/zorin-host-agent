@@ -25,11 +25,12 @@ import (
 )
 
 const (
-	version      = "0.2.2"
+	version      = "0.3.0"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
 	androidAct   = "android.app.NativeActivity"
+	androidSvc   = "dev.zorin.trustruntime.TrustService"
 	protocolName = "ZTRUST/2"
 )
 
@@ -455,6 +456,8 @@ func (a *Agent) sessionUp(live *liveSession) {
 	a.writeOwnerModeLocked()
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
+	// The red pulse is emitted only after mutual cryptographic authentication succeeds.
+	a.pulseOwnerVisual()
 	if wasEmpty {
 		runHook(a.onTrust)
 	}
@@ -546,19 +549,54 @@ func (a *Agent) hasLiveSession() bool {
 	return len(a.sessions) > 0
 }
 
+func (a *Agent) startTrustService(serial string, pulse bool) error {
+	args := []string{"-s", serial, "shell", "am", "start-foreground-service", "-n", androidPkg + "/" + androidSvc, "--ez", "dev.zorin.trust.ensure", "true"}
+	if pulse {
+		args = append(args, "--ez", "dev.zorin.trust.pulse", "true")
+	}
+	out, err := exec.Command("adb", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("TrustService start failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (a *Agent) wakeAndroid(serial string, visible bool) {
-	args := []string{"-s", serial, "shell", "am", "start"}
-	if !visible {
-		args = append(args, "-f", "0x00810000") // EXCLUDE_FROM_RECENTS | NO_ANIMATION
+	// Known hosts no longer wake the Activity. The foreground TrustService owns the
+	// persistent runtime and survives UI removal from Recents.
+	if err := a.startTrustService(serial, false); err != nil {
+		fmt.Fprintln(os.Stderr, "trust service:", err)
 	}
-	args = append(args, "-n", androidPkg+"/"+androidAct, "--ez", "dev.zorin.trust.autoconnect", "true")
-	if !visible {
-		args = append(args, "--ez", "dev.zorin.trust.headless", "true")
+	if visible {
+		args := []string{"-s", serial, "shell", "am", "start", "-n", androidPkg + "/" + androidAct, "--ez", "dev.zorin.trust.autoconnect", "true"}
+		_ = exec.Command("adb", args...).Run()
 	}
-	_ = exec.Command("adb", args...).Run()
 	a.mu.Lock()
 	a.lastWake[serial] = time.Now()
 	a.mu.Unlock()
+}
+
+func (a *Agent) pulseOwnerVisual() {
+	a.mu.Lock()
+	serial := strings.TrimSpace(a.adbSerial)
+	if serial == "" {
+		for s := range a.seenADB {
+			if serial != "" { // Ambiguous: never pulse the wrong device.
+				serial = ""
+				break
+			}
+			serial = s
+		}
+	}
+	a.mu.Unlock()
+	if serial == "" {
+		return
+	}
+	go func() {
+		if err := a.startTrustService(serial, true); err != nil {
+			fmt.Fprintln(os.Stderr, "trust visual:", err)
+		}
+	}()
 }
 
 func (a *Agent) shouldHeadlessWake(serial string, first bool) bool {

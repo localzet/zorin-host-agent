@@ -24,10 +24,21 @@ try {
     }
 } catch { Write-Host 'Autostart: NOT INSTALLED' -ForegroundColor Yellow }
 
-$procs = @(Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue)
-if ($procs.Count -eq 0) { Write-Host 'Agent process: NOT RUNNING' -ForegroundColor Yellow }
+# Process-name matching is unreliable after the binary is copied/renamed. Resolve the
+# actual daemon by its listening trust port first, then fall back to process-name matching.
+$ids = @()
+try {
+    $ids = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 47472 -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+} catch {}
+if ($ids.Count -eq 0) {
+    $ids = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'zorin-host-agent*' } | Select-Object -ExpandProperty Id)
+}
+if ($ids.Count -eq 0) { Write-Host 'Agent process: NOT RUNNING' -ForegroundColor Yellow }
 else {
-    Write-Host "Agent process(es): $($procs.Count)" -ForegroundColor Green
-    foreach ($p in $procs) { $path=''; try{$path=$p.Path}catch{}; if($path){Write-Host "  PID $($p.Id)  $path"}else{Write-Host "  PID $($p.Id)"} }
+    Write-Host "Agent process(es): $($ids.Count)" -ForegroundColor Green
+    foreach ($id in $ids) {
+        $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+        if ($null -ne $p) { $path=''; try{$path=$p.Path}catch{}; if($path){Write-Host "  PID $id  $path"}else{Write-Host "  PID $id"} }
+    }
 }
 & $Exe status

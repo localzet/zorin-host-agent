@@ -24,3 +24,9 @@
 
 ## 0.1.3
 - Idempotent pairing/install lifecycle fixes.
+
+## 0.3.0
+- Bootstrap `dev.zorin.trustruntime.TrustService` directly for known-host reconnects; normal owner USB reconnects no longer wake `NativeActivity`.
+- Trigger the stock red Trust Visual pulse only after a successful mutual `ZTRUST/2` session is established.
+- Skip automatic pulse when more than one ADB device is present and no explicit `--serial` is configured.
+- Windows lifecycle/status scripts now identify the daemon by its trust listener port instead of relying on an executable/process name.

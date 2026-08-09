@@ -33,3 +33,7 @@ The phone is not a generic signing oracle and the desktop listener is not a remo
 
 ### Device trust vs owner presence
 From v0.2.2, device trust survives screen lock. `session.json` therefore means *paired device is cryptographically present*, not necessarily *user is actively present*. Sensitive integrations should use `authorize` / `gate`; these require `user_present=true` and a fresh phone-signed owner proof.
+
+### v0.3 service + visual lifecycle
+
+Known paired-host reconnects now start the phone's foreground `TrustService` directly through ADB shell instead of launching the UI Activity. After mutual authentication succeeds, the agent requests one predefined red owner-trust pulse. Pairing remains the only normal flow that intentionally opens the TRUST UI.
