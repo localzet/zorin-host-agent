@@ -63,8 +63,21 @@ func (a *Agent) handleControl(c net.Conn) {
 	case "status":
 		a.mu.Lock()
 		trusted := len(a.live) > 0
+		present := false
+		for _, s := range a.live {
+			if s.userPresent {
+				present = true
+				break
+			}
+		}
 		a.mu.Unlock()
-		_ = json.NewEncoder(c).Encode(controlResponse{OK: true, Allowed: trusted, Reason: map[bool]string{true: "trusted owner session active", false: "no trusted owner session"}[trusted]})
+		reason := "no trusted device session"
+		if trusted && present {
+			reason = "trusted device + owner presence"
+		} else if trusted {
+			reason = "trusted device; phone locked"
+		}
+		_ = json.NewEncoder(c).Encode(controlResponse{OK: true, Allowed: trusted, Reason: reason})
 	default:
 		_ = json.NewEncoder(c).Encode(controlResponse{Error: "unsupported control operation"})
 	}
@@ -80,9 +93,15 @@ func (a *Agent) authorize(action, resource string) controlResponse {
 	trusted := len(a.live) > 0
 	var live *liveSession
 	for _, s := range a.live {
-		live = s
-		break
+		if s.userPresent {
+			live = s
+			break
+		}
+		if live == nil {
+			live = s
+		}
 	}
+	present := live != nil && live.userPresent
 	a.mu.Unlock()
 	cfg := loadPolicy(a.stateDir)
 	d := evaluatePolicy(cfg, action, resource, trusted)
@@ -91,6 +110,9 @@ func (a *Agent) authorize(action, resource string) controlResponse {
 	}
 	if live == nil {
 		return controlResponse{OK: true, Allowed: false, Reason: "trusted session disappeared"}
+	}
+	if !present {
+		return controlResponse{OK: true, Allowed: false, Reason: "owner presence required: phone is locked"}
 	}
 	ttl := 30
 	if d.Rule != nil && d.Rule.ProofTTLSeconds > 0 {

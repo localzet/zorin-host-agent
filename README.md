@@ -29,3 +29,7 @@ zorin-host-agent.exe identity migrate-tpm
 ## Security boundaries
 
 The phone is not a generic signing oracle and the desktop listener is not a remote shell. High-level operations are fixed, domain-separated and policy checked. A local administrator can still subvert a user-mode agent; system-level Windows hardening is a later layer, not something v0.2 claims to solve.
+
+
+### Device trust vs owner presence
+From v0.2.2, device trust survives screen lock. `session.json` therefore means *paired device is cryptographically present*, not necessarily *user is actively present*. Sensitive integrations should use `authorize` / `gate`; these require `user_present=true` and a fresh phone-signed owner proof.

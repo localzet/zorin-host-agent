@@ -45,7 +45,7 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 	pnonce := randomHex(32)
 	d := sha256.Sum256(phoneProofMessage(hnonce, pnonce, hpub, phex))
 	psig, _ := ecdsa.SignASN1(rand.Reader, pk, d[:])
-	if err := writeLines(cli, "PHONE_PUB "+phex, "PHONE_NONCE "+pnonce, "PHONE_SIG "+hex.EncodeToString(psig), "END"); err != nil {
+	if err := writeLines(cli, "PHONE_PUB "+phex, "PHONE_NONCE "+pnonce, "PHONE_SIG "+hex.EncodeToString(psig), "PHONE_STATE UNLOCKED", "END"); err != nil {
 		t.Fatal(err)
 	}
 	af, err := readFrame(r)
@@ -108,6 +108,25 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("authorize timed out")
+	}
+
+	// Locking the phone must keep device trust alive but revoke user presence.
+	if err := writeLines(cli, "POLL LOCKED"); err != nil {
+		t.Fatal(err)
+	}
+	pong, err = r.ReadString('\n')
+	if err != nil || pong != "PONG\n" {
+		t.Fatalf("locked heartbeat failed: %q %v", pong, err)
+	}
+	a.mu.Lock()
+	sess, stillTrusted := a.sessions[pfp]
+	a.mu.Unlock()
+	if !stillTrusted || !sess.Trusted || sess.UserPresent {
+		t.Fatalf("lock should preserve device trust but clear presence: %#v", sess)
+	}
+	resp := a.authorize("owner.console", "local:test")
+	if resp.Allowed || resp.Reason == "" {
+		t.Fatalf("locked phone should deny owner proof: %#v", resp)
 	}
 	_ = writeLines(cli, "BYE")
 }

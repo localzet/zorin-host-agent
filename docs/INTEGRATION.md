@@ -13,3 +13,6 @@ zorin-host-agent.exe daemon `
 The phone never supplies hook command text. This separation is intentional: the USB protocol proves identity/presence; local host policy decides what that presence unlocks.
 
 Do not make the mere existence of a USB device or ADB serial your authorization signal. Gate sensitive features on the authenticated session produced by the agent.
+
+
+`session.json` persists while the paired device remains cryptographically connected, including while its screen is locked. Inspect `user_present` when displaying state. Do not use `session.json` alone for sensitive authorization. `owner-mode.json` is the convenience presence file and is removed whenever all trusted phones are locked. For security-sensitive actions prefer the local `authorize`/`gate` API, which obtains a signed proof from an unlocked phone.

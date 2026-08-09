@@ -31,3 +31,7 @@ and replies with `PROOF_RESULT OK` + DER ECDSA signature. There is no raw-sign, 
 ## Local control
 
 The daemon separately binds `127.0.0.1:47473`. Requests are JSON and require a random control token from the per-user state directory. This API is for local applications/CLI integration and does not accept remote network connections.
+
+
+## Lock state (v0.2.2)
+The phone keeps the mutually authenticated transport alive across screen lock. Heartbeats are `POLL UNLOCKED` or `POLL LOCKED`. `session.json` remains trusted in either state and includes `user_present`. `owner-mode.json` exists only while `user_present=true`. Proof requests are not issued while the phone is locked.

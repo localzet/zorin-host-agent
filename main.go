@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	version      = "0.2.0"
+	version      = "0.2.2"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
-	androidPkg   = "dev.zorin.nativelab"
+	androidPkg   = "dev.zorin.trustruntime"
 	androidAct   = "android.app.NativeActivity"
 	protocolName = "ZTRUST/2"
 )
@@ -45,6 +45,7 @@ type Session struct {
 	LastSeen             time.Time `json:"last_seen"`
 	Policy               string    `json:"policy"`
 	HostIdentityProvider string    `json:"host_identity_provider"`
+	UserPresent          bool      `json:"user_present"`
 }
 
 type proofRequest struct {
@@ -58,9 +59,10 @@ type proofResult struct {
 	err   error
 }
 type liveSession struct {
-	phoneFP  string
-	phoneDER []byte
-	req      chan proofRequest
+	phoneFP     string
+	phoneDER    []byte
+	req         chan proofRequest
+	userPresent bool
 }
 
 type Agent struct {
@@ -80,6 +82,7 @@ type Agent struct {
 	sessions map[string]Session
 	live     map[string]*liveSession
 	seenADB  map[string]bool
+	lastWake map[string]time.Time
 }
 
 func main() {
@@ -186,7 +189,7 @@ func loadAgent() (*Agent, error) {
 		return nil, err
 	}
 	_, _ = ensurePolicy(stateDir)
-	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}}, nil
+	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}}, nil
 }
 
 func ensureControlToken(stateDir string) (string, error) {
@@ -310,6 +313,8 @@ func (a *Agent) handle(c net.Conn) {
 		return
 	}
 	phonePubHex, phoneNonce, phoneSigHex := f["PHONE_PUB"], f["PHONE_NONCE"], f["PHONE_SIG"]
+	phoneState := f["PHONE_STATE"]
+	initialPresence := !strings.EqualFold(phoneState, "LOCKED")
 	if phonePubHex == "" || phoneNonce == "" || phoneSigHex == "" {
 		_ = writeLines(c, "AUTH FAIL malformed", "END")
 		return
@@ -366,7 +371,7 @@ func (a *Agent) handle(c net.Conn) {
 		return
 	}
 	_ = c.SetDeadline(time.Time{})
-	live := &liveSession{phoneFP: phoneFP, phoneDER: append([]byte(nil), phoneDER...), req: make(chan proofRequest, 8)}
+	live := &liveSession{phoneFP: phoneFP, phoneDER: append([]byte(nil), phoneDER...), req: make(chan proofRequest, 8), userPresent: initialPresence}
 	a.sessionUp(live)
 	defer a.sessionDown(phoneFP)
 	for {
@@ -376,8 +381,15 @@ func (a *Agent) handle(c net.Conn) {
 			return
 		}
 		line = strings.TrimSpace(line)
-		if line == "POLL" || line == "PING" {
-			a.sessionTouch(phoneFP)
+		if strings.HasPrefix(line, "POLL") || line == "PING" {
+			present := true
+			if strings.HasPrefix(line, "POLL") {
+				parts := strings.Fields(line)
+				if len(parts) > 1 && strings.EqualFold(parts[1], "LOCKED") {
+					present = false
+				}
+			}
+			a.sessionTouch(phoneFP, present)
 			var pr *proofRequest
 			select {
 			case q := <-live.req:
@@ -438,7 +450,7 @@ func (a *Agent) sessionUp(live *liveSession) {
 	wasEmpty := len(a.sessions) == 0
 	now := time.Now()
 	a.live[live.phoneFP] = live
-	a.sessions[live.phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: live.phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation", HostIdentityProvider: a.identity.Provider()}
+	a.sessions[live.phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: live.phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation", HostIdentityProvider: a.identity.Provider(), UserPresent: live.userPresent}
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
 	a.mu.Unlock()
@@ -447,10 +459,14 @@ func (a *Agent) sessionUp(live *liveSession) {
 		runHook(a.onTrust)
 	}
 }
-func (a *Agent) sessionTouch(phoneFP string) {
+func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 	a.mu.Lock()
+	if l := a.live[phoneFP]; l != nil {
+		l.userPresent = userPresent
+	}
 	s := a.sessions[phoneFP]
 	s.LastSeen = time.Now()
+	s.UserPresent = userPresent
 	a.sessions[phoneFP] = s
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
@@ -490,11 +506,18 @@ func (a *Agent) writeOwnerModeLocked() {
 	}
 	var newest Session
 	for _, s := range a.sessions {
+		if !s.UserPresent {
+			continue
+		}
 		if newest.Since.IsZero() || s.LastSeen.After(newest.LastSeen) {
 			newest = s
 		}
 	}
-	m := map[string]any{"trusted": true, "policy": "owner-workstation", "host_fingerprint": a.hostFP, "phone_fingerprint": newest.PhoneFingerprint, "identity_provider": a.identity.Provider(), "since": newest.Since, "last_seen": newest.LastSeen, "control": "local-authenticated"}
+	if newest.Since.IsZero() {
+		_ = os.Remove(p)
+		return
+	}
+	m := map[string]any{"trusted": true, "user_present": true, "policy": "owner-workstation", "host_fingerprint": a.hostFP, "phone_fingerprint": newest.PhoneFingerprint, "identity_provider": a.identity.Provider(), "since": newest.Since, "last_seen": newest.LastSeen, "control": "local-authenticated"}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	_ = os.WriteFile(p, b, 0600)
 }
@@ -517,6 +540,43 @@ func runHook(command string) {
 		}
 	}()
 }
+func (a *Agent) hasLiveSession() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.sessions) > 0
+}
+
+func (a *Agent) wakeAndroid(serial string, visible bool) {
+	args := []string{"-s", serial, "shell", "am", "start"}
+	if !visible {
+		args = append(args, "-f", "0x00810000") // EXCLUDE_FROM_RECENTS | NO_ANIMATION
+	}
+	args = append(args, "-n", androidPkg+"/"+androidAct, "--ez", "dev.zorin.trust.autoconnect", "true")
+	if !visible {
+		args = append(args, "--ez", "dev.zorin.trust.headless", "true")
+	}
+	_ = exec.Command("adb", args...).Run()
+	a.mu.Lock()
+	a.lastWake[serial] = time.Now()
+	a.mu.Unlock()
+}
+
+func (a *Agent) shouldHeadlessWake(serial string, first bool) bool {
+	if a.pairOnce {
+		return false
+	}
+	if first {
+		return true
+	}
+	if a.hasLiveSession() {
+		return false
+	}
+	a.mu.Lock()
+	last := a.lastWake[serial]
+	a.mu.Unlock()
+	return time.Since(last) >= 15*time.Second
+}
+
 func (a *Agent) adbWatcher() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -551,13 +611,18 @@ func (a *Agent) adbSweep() {
 		a.mu.Unlock()
 		if first {
 			fmt.Printf("ADB device connected: %s; reverse installed\n", serial)
-			_ = exec.Command("adb", "-s", serial, "shell", "am", "start", "-n", androidPkg+"/"+androidAct, "--ez", "dev.zorin.trust.autoconnect", "true").Run()
+		}
+		if a.pairOnce && first {
+			a.wakeAndroid(serial, true)
+		} else if a.shouldHeadlessWake(serial, first) {
+			a.wakeAndroid(serial, false)
 		}
 	}
 	a.mu.Lock()
 	for s := range a.seenADB {
 		if !current[s] {
 			delete(a.seenADB, s)
+			delete(a.lastWake, s)
 			fmt.Printf("ADB device disconnected: %s\n", s)
 		}
 	}
