@@ -37,3 +37,8 @@ Optional owner-session hooks:
 ```
 
 `status` prints paired phone fingerprints and the active session file.
+
+
+### Selecting an ADB device
+
+Use `daemon --serial <adb-serial>` to constrain reverse/wake handling to one authorized device. The Windows pairing script selects the only connected authorized device automatically.

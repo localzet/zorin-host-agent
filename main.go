@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	version      = "0.1.0"
+	version      = "0.1.1"
 	listenAddr   = "127.0.0.1:47472"
 	androidPkg   = "dev.zorin.nativelab"
 	androidAct   = "android.app.NativeActivity"
@@ -56,6 +56,7 @@ type Agent struct {
 	pairOnce  bool
 	onTrust   string
 	onUntrust string
+	adbSerial string
 
 	mu       sync.Mutex
 	sessions map[string]Session
@@ -68,6 +69,7 @@ func main() {
 	onTrust := daemon.String("on-trust", "", "optional local command to run when the first trusted USB session appears")
 	onUntrust := daemon.String("on-untrust", "", "optional local command to run when the last trusted USB session disappears")
 	noADB := daemon.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
+	adbSerial := daemon.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
 
 	cmd := "daemon"
 	args := os.Args[1:]
@@ -86,9 +88,13 @@ func main() {
 		_ = daemon.Parse(args)
 		a.pairOnce = *pairOnce
 		a.onTrust, a.onUntrust = *onTrust, *onUntrust
+		a.adbSerial = strings.TrimSpace(*adbSerial)
 		fmt.Printf("Zorin Host Agent %s\n", version)
 		fmt.Printf("Host identity: %s\n", a.hostFP)
 		fmt.Printf("Listen: %s\n", listenAddr)
+		if a.adbSerial != "" {
+			fmt.Printf("ADB target: %s\n", a.adbSerial)
+		}
 		if a.pairOnce {
 			fmt.Println("PAIR WINDOW: the next phone approved on-device may be enrolled")
 		}
@@ -453,6 +459,9 @@ func (a *Agent) adbSweep() {
 			continue
 		}
 		serial := f[0]
+		if a.adbSerial != "" && serial != a.adbSerial {
+			continue
+		}
 		current[serial] = true
 		_ = exec.Command("adb", "-s", serial, "reverse", "tcp:47472", "tcp:47472").Run()
 		a.mu.Lock()
