@@ -3,13 +3,11 @@ package main
 import (
 	"bufio"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,64 +18,77 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	version      = "0.1.1"
+	version      = "0.2.0"
 	listenAddr   = "127.0.0.1:47472"
+	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.nativelab"
 	androidAct   = "android.app.NativeActivity"
-	protocolName = "ZTRUST/1"
+	protocolName = "ZTRUST/2"
 )
 
 type Config struct {
-	PairedPhones map[string]string `json:"paired_phones"` // fingerprint -> PKIX DER hex
+	PairedPhones map[string]string `json:"paired_phones"`
 }
 
 type Session struct {
-	Trusted          bool      `json:"trusted"`
-	HostFingerprint  string    `json:"host_fingerprint"`
-	PhoneFingerprint string    `json:"phone_fingerprint"`
-	Since            time.Time `json:"since"`
-	LastSeen         time.Time `json:"last_seen"`
-	Policy           string    `json:"policy"`
+	Trusted              bool      `json:"trusted"`
+	HostFingerprint      string    `json:"host_fingerprint"`
+	PhoneFingerprint     string    `json:"phone_fingerprint"`
+	Since                time.Time `json:"since"`
+	LastSeen             time.Time `json:"last_seen"`
+	Policy               string    `json:"policy"`
+	HostIdentityProvider string    `json:"host_identity_provider"`
+}
+
+type proofRequest struct {
+	action   string
+	resource string
+	ttl      int
+	result   chan proofResult
+}
+type proofResult struct {
+	proof OwnerProof
+	err   error
+}
+type liveSession struct {
+	phoneFP  string
+	phoneDER []byte
+	req      chan proofRequest
 }
 
 type Agent struct {
-	hostKey   *ecdsa.PrivateKey
-	hostPub   []byte
-	hostFP    string
-	cfg       Config
-	cfgPath   string
-	stateDir  string
-	pairOnce  bool
-	onTrust   string
-	onUntrust string
-	adbSerial string
+	identity     HostIdentity
+	hostPub      []byte
+	hostFP       string
+	cfg          Config
+	cfgPath      string
+	stateDir     string
+	pairOnce     bool
+	onTrust      string
+	onUntrust    string
+	adbSerial    string
+	controlToken string
 
 	mu       sync.Mutex
 	sessions map[string]Session
+	live     map[string]*liveSession
 	seenADB  map[string]bool
 }
 
 func main() {
-	daemon := flag.NewFlagSet("daemon", flag.ExitOnError)
-	pairOnce := daemon.Bool("pair-once", false, "allow the next cryptographically valid, phone-approved device to pair")
-	onTrust := daemon.String("on-trust", "", "optional local command to run when the first trusted USB session appears")
-	onUntrust := daemon.String("on-untrust", "", "optional local command to run when the last trusted USB session disappears")
-	noADB := daemon.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
-	adbSerial := daemon.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
-
 	cmd := "daemon"
 	args := os.Args[1:]
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd = args[0]
 		args = args[1:]
 	}
-
 	a, err := loadAgent()
 	if err != nil {
 		fatal(err)
@@ -85,13 +96,21 @@ func main() {
 
 	switch cmd {
 	case "daemon":
-		_ = daemon.Parse(args)
+		fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+		pairOnce := fs.Bool("pair-once", false, "allow the next cryptographically valid, phone-approved device to pair")
+		onTrust := fs.String("on-trust", "", "optional local command to run when the first trusted USB session appears")
+		onUntrust := fs.String("on-untrust", "", "optional local command to run when the last trusted USB session disappears")
+		noADB := fs.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
+		serial := fs.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
+		_ = fs.Parse(args)
 		a.pairOnce = *pairOnce
-		a.onTrust, a.onUntrust = *onTrust, *onUntrust
-		a.adbSerial = strings.TrimSpace(*adbSerial)
+		a.onTrust = *onTrust
+		a.onUntrust = *onUntrust
+		a.adbSerial = strings.TrimSpace(*serial)
 		fmt.Printf("Zorin Host Agent %s\n", version)
 		fmt.Printf("Host identity: %s\n", a.hostFP)
-		fmt.Printf("Listen: %s\n", listenAddr)
+		fmt.Printf("Identity provider: %s\n", a.identity.Provider())
+		fmt.Printf("Trust listen: %s\nControl API: %s\n", listenAddr, controlAddr)
 		if a.adbSerial != "" {
 			fmt.Printf("ADB target: %s\n", a.adbSerial)
 		}
@@ -101,35 +120,41 @@ func main() {
 		if !*noADB {
 			go a.adbWatcher()
 		}
+		go func() {
+			if err := a.serveControl(); err != nil {
+				fmt.Fprintln(os.Stderr, "control error:", err)
+			}
+		}()
 		if err := a.serve(); err != nil {
 			fatal(err)
 		}
 	case "status":
-		fmt.Printf("Zorin Host Agent %s\nHost identity: %s\n", version, a.hostFP)
-		fps := make([]string, 0, len(a.cfg.PairedPhones))
-		for fp := range a.cfg.PairedPhones {
-			fps = append(fps, fp)
+		a.printStatus()
+	case "fingerprint":
+		fmt.Println(a.hostFP)
+	case "policy":
+		p := filepath.Join(a.stateDir, "policy.json")
+		_, _ = ensurePolicy(a.stateDir)
+		fmt.Println(p)
+		if b, err := os.ReadFile(p); err == nil {
+			fmt.Println(string(b))
 		}
-		sort.Strings(fps)
-		fmt.Printf("Paired phones: %d\n", len(fps))
-		for _, fp := range fps {
-			fmt.Printf("  %s\n", fp)
-		}
-		if b, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
-			fmt.Printf("Active state:\n%s\n", b)
-		} else {
-			fmt.Println("Active state: none")
-		}
+	case "authorize", "credential":
+		runAuthorizeCLI(a, args)
+	case "gate":
+		runGateCLI(a, args)
+	case "identity":
+		runIdentityCLI(a, args)
 	case "unpair-all":
 		a.cfg.PairedPhones = map[string]string{}
 		if err := a.saveConfig(); err != nil {
 			fatal(err)
 		}
 		fmt.Println("All paired phones removed.")
-	case "fingerprint":
-		fmt.Println(a.hostFP)
+	case "version":
+		fmt.Println(version)
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|fingerprint|unpair-all] [options]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|authorize|credential|gate|policy|identity|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 }
@@ -143,17 +168,11 @@ func loadAgent() (*Agent, error) {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return nil, err
 	}
-
-	keyPath := filepath.Join(stateDir, "host-identity.pem")
-	key, err := loadOrCreateKey(keyPath)
+	id, err := loadHostIdentity(stateDir)
 	if err != nil {
 		return nil, err
 	}
-	pub, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-
+	pub := id.PublicDER()
 	cfgPath := filepath.Join(stateDir, "config.json")
 	cfg := Config{PairedPhones: map[string]string{}}
 	if b, err := os.ReadFile(cfgPath); err == nil {
@@ -162,55 +181,61 @@ func loadAgent() (*Agent, error) {
 			cfg.PairedPhones = map[string]string{}
 		}
 	}
-	a := &Agent{hostKey: key, hostPub: pub, hostFP: fingerprint(pub), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, sessions: map[string]Session{}, seenADB: map[string]bool{}}
-	return a, nil
-}
-
-func loadOrCreateKey(path string) (*ecdsa.PrivateKey, error) {
-	if b, err := os.ReadFile(path); err == nil {
-		block, _ := pem.Decode(b)
-		if block == nil {
-			return nil, errors.New("invalid host identity PEM")
-		}
-		k, err := x509.ParseECPrivateKey(block.Bytes)
-		if err != nil {
-			return nil, err
-		}
-		return k, nil
-	}
-	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	token, err := ensureControlToken(stateDir)
 	if err != nil {
 		return nil, err
 	}
-	der, err := x509.MarshalECPrivateKey(k)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0600); err != nil {
-		return nil, err
-	}
-	return k, nil
+	_, _ = ensurePolicy(stateDir)
+	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}}, nil
 }
 
+func ensureControlToken(stateDir string) (string, error) {
+	p := filepath.Join(stateDir, "control.token")
+	if b, err := os.ReadFile(p); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
+		return strings.TrimSpace(string(b)), nil
+	}
+	t := randomHex(32)
+	if err := os.WriteFile(p, []byte(t+"\n"), 0600); err != nil {
+		return "", err
+	}
+	return t, nil
+}
 func (a *Agent) saveConfig() error {
 	b, _ := json.MarshalIndent(a.cfg, "", "  ")
 	return os.WriteFile(a.cfgPath, b, 0600)
 }
 
-func fingerprint(der []byte) string {
-	h := sha256.Sum256(der)
-	// 128-bit display fingerprint is enough for human comparison while the full key is stored/verified.
-	s := strings.ToUpper(hex.EncodeToString(h[:16]))
-	parts := make([]string, 0, 8)
-	for i := 0; i < len(s); i += 4 {
-		parts = append(parts, s[i:i+4])
+func (a *Agent) printStatus() {
+	fmt.Printf("Zorin Host Agent %s\nHost identity: %s\nIdentity provider: %s\n", version, a.hostFP, a.identity.Provider())
+	fps := make([]string, 0, len(a.cfg.PairedPhones))
+	for fp := range a.cfg.PairedPhones {
+		fps = append(fps, fp)
 	}
-	return strings.Join(parts, ":")
+	sort.Strings(fps)
+	fmt.Printf("Paired phones: %d\n", len(fps))
+	for _, fp := range fps {
+		fmt.Printf("  %s\n", fp)
+	}
+	fmt.Printf("Policy: %s\n", filepath.Join(a.stateDir, "policy.json"))
+	fmt.Printf("Control API: %s (token file protected in state dir)\n", controlAddr)
+	if b, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
+		fmt.Printf("Active state:\n%s\n", b)
+	} else {
+		fmt.Println("Active state: none")
+	}
+	if b, err := os.ReadFile(filepath.Join(a.stateDir, "owner-mode.json")); err == nil {
+		fmt.Printf("Owner mode:\n%s\n", b)
+	} else {
+		fmt.Println("Owner mode: locked")
+	}
 }
 
 func (a *Agent) serve() error {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "address already in use") || strings.Contains(strings.ToLower(err.Error()), "only one usage") {
+			return fmt.Errorf("another Zorin Host Agent is already listening on %s; stop/restart it or use the pairing script: %w", listenAddr, err)
+		}
 		return err
 	}
 	defer ln.Close()
@@ -230,7 +255,6 @@ func randomHex(n int) string {
 	}
 	return hex.EncodeToString(b)
 }
-
 func writeLines(w io.Writer, lines ...string) error {
 	for _, s := range lines {
 		if _, err := io.WriteString(w, s+"\n"); err != nil {
@@ -239,7 +263,6 @@ func writeLines(w io.Writer, lines ...string) error {
 	}
 	return nil
 }
-
 func readFrame(r *bufio.Reader) (map[string]string, error) {
 	out := map[string]string{}
 	for {
@@ -262,7 +285,6 @@ func readFrame(r *bufio.Reader) (map[string]string, error) {
 		}
 	}
 }
-
 func phoneProofMessage(hostNonce, phoneNonce, hostPubHex, phonePubHex string) []byte {
 	return []byte(protocolName + "|PHONE|" + hostNonce + "|" + phoneNonce + "|" + hostPubHex + "|" + phonePubHex)
 }
@@ -279,10 +301,9 @@ func (a *Agent) handle(c net.Conn) {
 	if hostName == "" {
 		hostName = runtime.GOOS
 	}
-	if err := writeLines(c, protocolName, "HOST_NAME "+sanitize(hostName), "HOST_PUB "+hostPubHex, "HOST_NONCE "+hostNonce, "END"); err != nil {
+	if writeLines(c, protocolName, "HOST_NAME "+sanitize(hostName), "HOST_PUB "+hostPubHex, "HOST_NONCE "+hostNonce, "HOST_IDENTITY "+a.identity.Provider(), "END") != nil {
 		return
 	}
-
 	r := bufio.NewReader(c)
 	f, err := readFrame(r)
 	if err != nil {
@@ -310,7 +331,6 @@ func (a *Agent) handle(c net.Conn) {
 	}
 	sig, err := hex.DecodeString(phoneSigHex)
 	if err != nil {
-		_ = writeLines(c, "AUTH FAIL phone-sig", "END")
 		return
 	}
 	digest := sha256.Sum256(phoneProofMessage(hostNonce, phoneNonce, hostPubHex, phonePubHex))
@@ -318,7 +338,6 @@ func (a *Agent) handle(c net.Conn) {
 		_ = writeLines(c, "AUTH FAIL bad-phone-signature", "END")
 		return
 	}
-
 	phoneFP := fingerprint(phoneDER)
 	a.mu.Lock()
 	pairedHex, paired := a.cfg.PairedPhones[phoneFP]
@@ -338,18 +357,17 @@ func (a *Agent) handle(c net.Conn) {
 		fmt.Printf("Rejected unpaired phone %s (restart with --pair-once to enroll)\n", phoneFP)
 		return
 	}
-
 	hd := sha256.Sum256(hostProofMessage(hostNonce, phoneNonce, hostPubHex, phonePubHex))
-	hostSig, err := ecdsa.SignASN1(rand.Reader, a.hostKey, hd[:])
+	hostSig, err := a.identity.SignDigest(hd[:])
 	if err != nil {
 		return
 	}
-	if err := writeLines(c, "AUTH OK", "HOST_SIG "+hex.EncodeToString(hostSig), "HOST_FINGERPRINT "+a.hostFP, "PHONE_FINGERPRINT "+phoneFP, "POLICY owner-workstation", "END"); err != nil {
+	if writeLines(c, "AUTH OK", "HOST_SIG "+hex.EncodeToString(hostSig), "HOST_FINGERPRINT "+a.hostFP, "PHONE_FINGERPRINT "+phoneFP, "POLICY owner-workstation", "PROOF_PROTOCOL ZOWNER/1", "END") != nil {
 		return
 	}
-
 	_ = c.SetDeadline(time.Time{})
-	a.sessionUp(phoneFP)
+	live := &liveSession{phoneFP: phoneFP, phoneDER: append([]byte(nil), phoneDER...), req: make(chan proofRequest, 8)}
+	a.sessionUp(live)
 	defer a.sessionDown(phoneFP)
 	for {
 		_ = c.SetReadDeadline(time.Now().Add(8 * time.Second))
@@ -358,9 +376,53 @@ func (a *Agent) handle(c net.Conn) {
 			return
 		}
 		line = strings.TrimSpace(line)
-		if line == "PING" {
+		if line == "POLL" || line == "PING" {
 			a.sessionTouch(phoneFP)
-			if err := writeLines(c, "PONG"); err != nil {
+			var pr *proofRequest
+			select {
+			case q := <-live.req:
+				pr = &q
+			default:
+			}
+			if pr == nil {
+				if writeLines(c, "PONG") != nil {
+					return
+				}
+				continue
+			}
+			issued := time.Now().Unix()
+			ttl := pr.ttl
+			if ttl < 5 {
+				ttl = 5
+			}
+			if ttl > 120 {
+				ttl = 120
+			}
+			expires := issued + int64(ttl)
+			nonce := randomHex(32)
+			ah := hex.EncodeToString([]byte(pr.action))
+			rh := hex.EncodeToString([]byte(pr.resource))
+			if writeLines(c, "PROOF_REQUEST", "ACTION_HEX "+ah, "RESOURCE_HEX "+rh, "NONCE "+nonce, "ISSUED "+strconv.FormatInt(issued, 10), "EXPIRES "+strconv.FormatInt(expires, 10), "END") != nil {
+				pr.result <- proofResult{err: errors.New("phone connection lost")}
+				return
+			}
+			rf, err := readFrame(r)
+			if err != nil {
+				pr.result <- proofResult{err: err}
+				return
+			}
+			if rf["PROOF_RESULT"] != "OK" || rf["SIGNATURE"] == "" {
+				pr.result <- proofResult{err: fmt.Errorf("phone proof denied: %s", rf["REASON"])}
+				_ = writeLines(c, "PONG")
+				continue
+			}
+			p := OwnerProof{Version: "ZOWNER/1", Action: pr.action, Resource: pr.resource, HostFingerprint: a.hostFP, PhoneFingerprint: phoneFP, PhonePublicKeyDERHex: phonePubHex, Nonce: nonce, Issued: issued, Expires: expires, SignatureDERHex: rf["SIGNATURE"]}
+			if err := verifyOwnerProof(p, phoneDER); err != nil {
+				pr.result <- proofResult{err: err}
+			} else {
+				pr.result <- proofResult{proof: p}
+			}
+			if writeLines(c, "PONG") != nil {
 				return
 			}
 		} else if line == "BYE" {
@@ -371,14 +433,16 @@ func (a *Agent) handle(c net.Conn) {
 	}
 }
 
-func (a *Agent) sessionUp(phoneFP string) {
+func (a *Agent) sessionUp(live *liveSession) {
 	a.mu.Lock()
 	wasEmpty := len(a.sessions) == 0
 	now := time.Now()
-	a.sessions[phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation"}
+	a.live[live.phoneFP] = live
+	a.sessions[live.phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: live.phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation", HostIdentityProvider: a.identity.Provider()}
 	a.writeSessionLocked()
+	a.writeOwnerModeLocked()
 	a.mu.Unlock()
-	fmt.Printf("TRUSTED session UP phone=%s\n", phoneFP)
+	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
 	if wasEmpty {
 		runHook(a.onTrust)
 	}
@@ -389,13 +453,16 @@ func (a *Agent) sessionTouch(phoneFP string) {
 	s.LastSeen = time.Now()
 	a.sessions[phoneFP] = s
 	a.writeSessionLocked()
+	a.writeOwnerModeLocked()
 	a.mu.Unlock()
 }
 func (a *Agent) sessionDown(phoneFP string) {
 	a.mu.Lock()
 	delete(a.sessions, phoneFP)
+	delete(a.live, phoneFP)
 	nowEmpty := len(a.sessions) == 0
 	a.writeSessionLocked()
+	a.writeOwnerModeLocked()
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session DOWN phone=%s\n", phoneFP)
 	if nowEmpty {
@@ -413,6 +480,22 @@ func (a *Agent) writeSessionLocked() {
 		list = append(list, s)
 	}
 	b, _ := json.MarshalIndent(list, "", "  ")
+	_ = os.WriteFile(p, b, 0600)
+}
+func (a *Agent) writeOwnerModeLocked() {
+	p := filepath.Join(a.stateDir, "owner-mode.json")
+	if len(a.sessions) == 0 {
+		_ = os.Remove(p)
+		return
+	}
+	var newest Session
+	for _, s := range a.sessions {
+		if newest.Since.IsZero() || s.LastSeen.After(newest.LastSeen) {
+			newest = s
+		}
+	}
+	m := map[string]any{"trusted": true, "policy": "owner-workstation", "host_fingerprint": a.hostFP, "phone_fingerprint": newest.PhoneFingerprint, "identity_provider": a.identity.Provider(), "since": newest.Since, "last_seen": newest.LastSeen, "control": "local-authenticated"}
+	b, _ := json.MarshalIndent(m, "", "  ")
 	_ = os.WriteFile(p, b, 0600)
 }
 
@@ -434,7 +517,6 @@ func runHook(command string) {
 		}
 	}()
 }
-
 func (a *Agent) adbWatcher() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -452,8 +534,7 @@ func (a *Agent) adbSweep() {
 		return
 	}
 	current := map[string]bool{}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(out), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 || f[1] != "device" {
 			continue
@@ -470,7 +551,6 @@ func (a *Agent) adbSweep() {
 		a.mu.Unlock()
 		if first {
 			fmt.Printf("ADB device connected: %s; reverse installed\n", serial)
-			// Wake the NativeActivity. Paired sessions require no tap; an unknown host still requires explicit APPROVE on the phone.
 			_ = exec.Command("adb", "-s", serial, "shell", "am", "start", "-n", androidPkg+"/"+androidAct, "--ez", "dev.zorin.trust.autoconnect", "true").Run()
 		}
 	}
@@ -483,7 +563,6 @@ func (a *Agent) adbSweep() {
 	}
 	a.mu.Unlock()
 }
-
 func sanitize(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' {

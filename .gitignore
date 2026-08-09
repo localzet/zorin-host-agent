@@ -5,3 +5,6 @@
 .DS_Store
 .idea/
 .vscode/
+.local/
+*.proof.json
+trusted-phones.json

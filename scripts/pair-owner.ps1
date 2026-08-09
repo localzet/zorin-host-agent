@@ -1,15 +1,9 @@
-$ErrorActionPreference = 'Stop'
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Exe = Join-Path (Split-Path -Parent $Here) 'dist\zorin-host-agent-windows-amd64.exe'
-if (-not (Test-Path $Exe)) { throw "Host agent not found: $Exe" }
-if (-not (Get-Command adb -ErrorAction SilentlyContinue)) { throw 'adb is not in PATH. Install Android Platform Tools first.' }
-$devices = @()
-adb devices | Select-Object -Skip 1 | ForEach-Object {
-    $f = ($_ -split '\s+') | Where-Object { $_ }
-    if ($f.Count -ge 2 -and $f[1] -eq 'device') { $devices += $f[0] }
-}
-if ($devices.Count -ne 1) { throw "Pairing expects exactly one authorized adb device; found $($devices.Count)." }
-$serial = $devices[0]
-Write-Host "Starting one-time owner pairing window for $serial" -ForegroundColor Cyan
-Write-Host 'The app will open. Go to TRUST and tap APPROVE HOST when the fingerprint is shown.'
-& $Exe daemon --pair-once --serial $serial
+$ErrorActionPreference='Stop'
+$Here=Split-Path -Parent $MyInvocation.MyCommand.Path;$Repo=Split-Path -Parent $Here;$arch=$env:PROCESSOR_ARCHITECTURE;$bin=if($arch -eq 'ARM64'){'zorin-host-agent-windows-arm64.exe'}else{'zorin-host-agent-windows-amd64.exe'};$Exe=Join-Path $Repo (Join-Path 'dist' $bin);$TaskName='ZorinTrustHostAgent';$StateDir=Join-Path $env:APPDATA 'ZorinTrust'
+if(-not(Test-Path $Exe)){throw "Host agent not found: $Exe"};if(-not(Get-Command adb -ErrorAction SilentlyContinue)){throw 'adb is not in PATH.'}
+$devices=@();adb devices|Select-Object -Skip 1|ForEach-Object{$f=($_ -split '\s+')|Where-Object{$_};if($f.Count-ge2-and$f[1]-eq'device'){$devices+=$f[0]}};if($devices.Count-ne1){throw "Pairing expects exactly one authorized adb device; found $($devices.Count)."};$serial=$devices[0]
+$HadTask=$false;try{Import-Module ScheduledTasks -ErrorAction Stop;$Task=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;if($null-ne$Task){$HadTask=$true;Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue}}catch{}
+$running=@(Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue);if($running.Count-gt0){Write-Host "Temporarily stopping $($running.Count) running agent process(es)..." -ForegroundColor Yellow;$running|Stop-Process -Force -ErrorAction SilentlyContinue;Start-Sleep -Milliseconds 300}
+Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue
+Write-Host "Starting one-time owner pairing window for $serial" -ForegroundColor Cyan;Write-Host 'The app will open. Go to TRUST and tap APPROVE HOST when the fingerprint is shown.';Write-Host 'Press Ctrl+C after TRUSTED session UP is confirmed.' -ForegroundColor DarkGray
+try{& $Exe daemon --pair-once --serial $serial}finally{Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue;if($HadTask){try{Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop;Write-Host 'Restored the autostart Zorin Host Agent.' -ForegroundColor Green}catch{Write-Warning "Could not restart autostart task: $($_.Exception.Message)"}}}

@@ -1,17 +1,33 @@
-# ZTRUST/1 host side
+# ZTRUST/2
 
-Transport in the stock-phone milestone is TCP on `127.0.0.1:47472` reached from Android using `adb reverse`.
+Stock-phone transport is TCP `127.0.0.1:47472` reached through `adb reverse`.
 
-The host sends:
+## Authentication
+
+Host sends its name, PKIX P-256 public key, fresh 256-bit nonce and identity-provider label. Phone returns its public key, nonce and ECDSA/SHA-256 proof over a domain-separated transcript. Host pins/validates the phone and returns its own proof.
+
+## Post-auth polling
+
+The phone sends `POLL`. Normally the host returns `PONG`. If a local policy-approved operation needs owner evidence, the host may instead return one bounded frame:
 
 ```text
-ZTRUST/1
-HOST_NAME <display-name>
-HOST_PUB <PKIX DER hex>
-HOST_NONCE <32 random bytes hex>
+PROOF_REQUEST
+ACTION_HEX <UTF-8 hex>
+RESOURCE_HEX <UTF-8 hex>
+NONCE <256-bit random hex>
+ISSUED <unix-seconds>
+EXPIRES <unix-seconds; max 120s>
 END
 ```
 
-The phone responds with its PKIX public key, nonce and an ECDSA/SHA-256 signature over a domain-separated transcript. The host verifies the signature and pinned phone key, then returns its own ECDSA signature.
+The unlocked phone only signs the canonical domain-separated message:
 
-After authentication, only `PING`, `BYE` and fixed protocol responses are accepted. This listener is not a shell/RPC endpoint.
+```text
+ZTRUST/2|OWNER_PROOF|host-fp|phone-fp|action-hex|resource-hex|nonce|issued|expires
+```
+
+and replies with `PROOF_RESULT OK` + DER ECDSA signature. There is no raw-sign, shell, arbitrary-file or arbitrary-Binder operation.
+
+## Local control
+
+The daemon separately binds `127.0.0.1:47473`. Requests are JSON and require a random control token from the per-user state directory. This API is for local applications/CLI integration and does not accept remote network connections.

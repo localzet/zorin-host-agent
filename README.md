@@ -1,44 +1,31 @@
 # Zorin Host Agent
 
-Desktop-side owner-presence agent for **Zorin Trust Runtime**.
+Desktop owner-presence, policy and credential-broker agent for **Zorin Trust Runtime**.
 
-The agent has a persistent P-256 host identity, watches authorized ADB devices, installs an `adb reverse` tunnel, wakes the Android NativeActivity, and performs mutual challenge/response with the phone. The phone identity private key stays in Android Keystore and is never exported.
+## v0.2 architecture
 
-## Security model
+- Mutual `ZTRUST/2` P-256 challenge/response with the phone.
+- Paired phone private key remains in Android Keystore.
+- Windows host identity supports CNG/TPM (`Microsoft Platform Crypto Provider`). Fresh Windows installs prefer TPM; existing v0.1 PEM identities are preserved until an explicit migration so upgrades do not silently break pairing.
+- Local deny-by-default `Principal/Action/Resource`-style policy in `policy.json`.
+- Authenticated local control endpoint on `127.0.0.1:47473`; its random token is stored in the per-user state directory.
+- `authorize` asks the connected/unlocked phone for a bounded, short-lived `ZOWNER/1` proof. The phone never signs arbitrary caller-supplied bytes.
+- `gate` runs a **locally chosen** command only after policy + live phone proof succeeds.
+- `owner-mode.json` exists only while an authenticated owner session is alive, so local applications can expose hidden/private features without trusting mere USB presence.
 
-- Pairing is explicit on both sides: start the host with `--pair-once`, then tap **APPROVE HOST** on the phone.
-- After pairing, each USB session is authenticated using fresh 256-bit nonces and ECDSA signatures in both directions.
-- An authenticated TCP connection is kept alive. Disconnecting USB tears the connection down and removes the trusted-session state.
-- Optional local hooks run only on the owner workstation and only after mutual authentication.
-- No server/SSH credential is sent to the host by this milestone.
-
-> v0.1 stores the host identity as a mode-0600 EC private key in the OS config directory. A Windows CNG/TPM backend is on the roadmap; do not treat v0.1 host-key storage as equivalent to TPM-backed identity.
-
-## Quick start
-
-```powershell
-.\zorin-host-agent-windows-amd64.exe daemon --pair-once
-```
-
-Keep it running, connect the authorized Android device via USB, and approve the displayed host fingerprint once on the phone.
-
-After pairing, normal startup is simply:
+## Useful commands
 
 ```powershell
-.\zorin-host-agent-windows-amd64.exe daemon
+zorin-host-agent.exe status
+zorin-host-agent.exe policy
+zorin-host-agent.exe authorize --action owner.console --resource local:demo
+zorin-host-agent.exe gate --action owner.console --resource local:owner-console -- powershell.exe
+zorin-host-agent.exe identity status
+zorin-host-agent.exe identity migrate-tpm
 ```
 
-Optional owner-session hooks:
+`credential.ssh` is deliberately denied by the default policy in this milestone. v0.2 establishes the signed credential primitive; the separate `zorin-access-broker` repository verifies those proofs and is where SSH certificate issuance will live.
 
-```powershell
-.\zorin-host-agent-windows-amd64.exe daemon `
-  --on-trust "powershell -File C:\\Zorin\\unlock.ps1" `
-  --on-untrust "powershell -File C:\\Zorin\\lock.ps1"
-```
+## Security boundaries
 
-`status` prints paired phone fingerprints and the active session file.
-
-
-### Selecting an ADB device
-
-Use `daemon --serial <adb-serial>` to constrain reverse/wake handling to one authorized device. The Windows pairing script selects the only connected authorized device automatically.
+The phone is not a generic signing oracle and the desktop listener is not a remote shell. High-level operations are fixed, domain-separated and policy checked. A local administrator can still subvert a user-mode agent; system-level Windows hardening is a later layer, not something v0.2 claims to solve.

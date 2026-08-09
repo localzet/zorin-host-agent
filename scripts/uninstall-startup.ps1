@@ -1,6 +1,1 @@
-$ErrorActionPreference = 'SilentlyContinue'
-$TaskName = 'ZorinTrustHostAgent'
-Import-Module ScheduledTasks -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue | Stop-Process -Force
-Write-Host 'Zorin Trust startup agent removed. Pairing keys were intentionally kept in LocalAppData\ZorinTrust.'
+$ErrorActionPreference='SilentlyContinue';$TaskName='ZorinTrustHostAgent';$StateDir=Join-Path $env:APPDATA 'ZorinTrust';Import-Module ScheduledTasks -ErrorAction SilentlyContinue;Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue;Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue|Stop-Process -Force -ErrorAction SilentlyContinue;Start-Sleep -Milliseconds 200;Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue;Write-Host 'Zorin Trust autostart removed. Pairing, policy, control token and identity were intentionally kept.'

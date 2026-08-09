@@ -1,7 +1,7 @@
 # Security
 
-Do not publish the generated host identity from `%LOCALAPPDATA%/ZorinTrust` (Windows) or the platform user config directory.
+Report vulnerabilities privately before opening public issues.
 
-The agent intentionally exposes only the fixed ZTRUST handshake/heartbeat protocol on `127.0.0.1:47472`; it is not a remote shell. `--on-trust` and `--on-untrust` are local administrator-configured hooks and are never supplied by the phone.
+Design constraints: no arbitrary remote command execution; no raw phone signing; proofs are domain-separated, action/resource-bound and short-lived; default policy denies unknown actions; pairing requires phone approval; ephemeral owner state is deleted when trust is lost.
 
-Report vulnerabilities privately before opening a public issue when practical.
+The local user account and administrators remain part of the workstation trust boundary. v0.2 does not claim to resist a fully compromised Windows kernel/admin account.

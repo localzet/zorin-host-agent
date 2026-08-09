@@ -1,47 +1,18 @@
 $ErrorActionPreference = 'Stop'
-
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Source = Join-Path (Split-Path -Parent $Here) 'dist\zorin-host-agent-windows-amd64.exe'
+$Repo = Split-Path -Parent $Here
+$arch = $env:PROCESSOR_ARCHITECTURE
+$bin = if ($arch -eq 'ARM64') { 'zorin-host-agent-windows-arm64.exe' } else { 'zorin-host-agent-windows-amd64.exe' }
+$Source = Join-Path $Repo (Join-Path 'dist' $bin)
 if (-not (Test-Path $Source)) { throw "Host agent not found: $Source" }
-
-$Dir = Join-Path $env:LOCALAPPDATA 'ZorinTrust\bin'
-New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-$Target = Join-Path $Dir 'zorin-host-agent.exe'
+$TaskName='ZorinTrustHostAgent'; $StateDir=Join-Path $env:APPDATA 'ZorinTrust'; $InstallRoot=Join-Path $env:LOCALAPPDATA 'ZorinTrust'; $Dir=Join-Path $InstallRoot 'bin'; $Target=Join-Path $Dir 'zorin-host-agent.exe'; $UserId=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+Import-Module ScheduledTasks -ErrorAction Stop; New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+$ExistingTask=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;if($null-ne$ExistingTask){Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue}
+$running=@(Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue);if($running.Count-gt0){Write-Host "Stopping $($running.Count) existing agent process(es) before update..." -ForegroundColor Yellow;$running|Stop-Process -Force -ErrorAction SilentlyContinue;Start-Sleep -Milliseconds 300}
+Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue
 Copy-Item -Force $Source $Target
-
-$TaskName = 'ZorinTrustHostAgent'
-$UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-# Do not use schtasks.exe /TR quoting here. Windows PowerShell 5.1 has awkward
-# native-command quote handling and paths with spaces are easy to break.
-# The ScheduledTasks API stores Execute and Arguments as separate fields.
-Import-Module ScheduledTasks -ErrorAction Stop
-
-$Action = New-ScheduledTaskAction -Execute $Target -Argument 'daemon'
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
-$Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
-$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $Action `
-    -Trigger $Trigger `
-    -Principal $Principal `
-    -Settings $Settings `
-    -Force | Out-Null
-
-$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-if ($Task.Actions.Execute -ne $Target -or $Task.Actions.Arguments -ne 'daemon') {
-    throw "Autostart verification failed: stored task action does not match the host agent."
-}
-
-# Replace any temporary/pairing daemon with the installed copy. Ignore access
-# errors for unrelated sessions, then start the current user's agent hidden.
-Get-Process 'zorin-host-agent' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 250
-$Started = Start-Process -WindowStyle Hidden -FilePath $Target -ArgumentList 'daemon' -PassThru
-
-Write-Host "Installed startup agent: $Target" -ForegroundColor Green
-Write-Host "Task: $TaskName" -ForegroundColor Green
-Write-Host "Task action: $($Task.Actions.Execute) $($Task.Actions.Arguments)"
-Write-Host "Agent PID: $($Started.Id)"
+$Action=New-ScheduledTaskAction -Execute $Target -Argument 'daemon';$Trigger=New-ScheduledTaskTrigger -AtLogOn -User $UserId;$Principal=New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited;$Settings=New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force|Out-Null
+$Task=Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop;if($Task.Actions.Execute-ne$Target-or$Task.Actions.Arguments-ne'daemon'){throw 'Autostart verification failed.'}
+$Started=Start-Process -WindowStyle Hidden -FilePath $Target -ArgumentList 'daemon' -PassThru;Start-Sleep -Milliseconds 500;if($Started.HasExited){throw "Host agent exited immediately with code $($Started.ExitCode)."}
+Write-Host "Installed/updated startup agent: $Target" -ForegroundColor Green;Write-Host "Task: $TaskName";Write-Host "Agent PID: $($Started.Id)"
