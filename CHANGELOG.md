@@ -1,3 +1,8 @@
+## 0.3.1
+- Headless reconnect remains service-only; the Activity is never started outside explicit pairing.
+- Increase failed headless bootstrap retry interval to 30s to prevent process-crash thrash.
+- Runtime 5.0.1 fixes the ART `VerifyError` that caused the v0.3 bootstrap loop.
+
 # Changelog
 
 ## 0.2.2

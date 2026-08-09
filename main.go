@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.3.0"
+	version      = "0.3.1"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -612,7 +612,9 @@ func (a *Agent) shouldHeadlessWake(serial string, first bool) bool {
 	a.mu.Lock()
 	last := a.lastWake[serial]
 	a.mu.Unlock()
-	return time.Since(last) >= 15*time.Second
+	// A successful am start can still be followed by an app-side crash. Never hammer
+	// the package in a tight loop; a reconnect is immediate, in-session recovery is bounded.
+	return time.Since(last) >= 30*time.Second
 }
 
 func (a *Agent) adbWatcher() {
