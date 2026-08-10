@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.4.0"
+	version      = "0.5.0"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -36,6 +36,7 @@ const (
 
 type Config struct {
 	PairedPhones map[string]string `json:"paired_phones"`
+	DeviceLabels map[string]string `json:"device_labels,omitempty"`
 	ADBPath      string            `json:"adb_path,omitempty"`
 }
 
@@ -97,6 +98,8 @@ type Agent struct {
 	pairOnce     bool
 	onTrust      string
 	onUntrust    string
+	onPresence   string
+	onAbsence    string
 	adbSerial    string
 	adbPath      string
 	controlToken string
@@ -129,6 +132,8 @@ func main() {
 		pairOnce := fs.Bool("pair-once", false, "allow the next cryptographically valid, phone-approved device to pair")
 		onTrust := fs.String("on-trust", "", "optional local command to run when the first trusted USB session appears")
 		onUntrust := fs.String("on-untrust", "", "optional local command to run when the last trusted USB session disappears")
+		onPresence := fs.String("on-presence", "", "optional local command when owner presence becomes available")
+		onAbsence := fs.String("on-absence", "", "optional local command when owner presence becomes unavailable")
 		noADB := fs.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
 		serial := fs.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
 		adbPath := fs.String("adb", "", "absolute path to adb executable; persisted for autostart reliability")
@@ -136,6 +141,8 @@ func main() {
 		a.pairOnce = *pairOnce
 		a.onTrust = *onTrust
 		a.onUntrust = *onUntrust
+		a.onPresence = *onPresence
+		a.onAbsence = *onAbsence
 		a.adbSerial = strings.TrimSpace(*serial)
 		if err := a.configureADB(strings.TrimSpace(*adbPath)); err != nil {
 			fmt.Fprintf(os.Stderr, "ADB unavailable: %v\n", err)
@@ -171,6 +178,8 @@ func main() {
 	case "status":
 		_ = a.configureADB("")
 		a.printStatus()
+	case "ui-state":
+		a.printUIState()
 	case "doctor":
 		_ = a.configureADB("")
 		a.printDoctor()
@@ -189,8 +198,11 @@ func main() {
 		runGateCLI(a, args)
 	case "identity":
 		runIdentityCLI(a, args)
+	case "device":
+		runDeviceCLI(a, args)
 	case "unpair-all":
 		a.cfg.PairedPhones = map[string]string{}
+		a.cfg.DeviceLabels = map[string]string{}
 		if err := a.saveConfig(); err != nil {
 			fatal(err)
 		}
@@ -198,7 +210,7 @@ func main() {
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|doctor|authorize|credential|gate|policy|identity|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|ui-state|doctor|authorize|credential|gate|policy|identity|device|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 }
@@ -218,11 +230,14 @@ func loadAgent() (*Agent, error) {
 	}
 	pub := id.PublicDER()
 	cfgPath := filepath.Join(stateDir, "config.json")
-	cfg := Config{PairedPhones: map[string]string{}}
+	cfg := Config{PairedPhones: map[string]string{}, DeviceLabels: map[string]string{}}
 	if b, err := os.ReadFile(cfgPath); err == nil {
 		_ = json.Unmarshal(b, &cfg)
 		if cfg.PairedPhones == nil {
 			cfg.PairedPhones = map[string]string{}
+		}
+		if cfg.DeviceLabels == nil {
+			cfg.DeviceLabels = map[string]string{}
 		}
 	}
 	token, err := ensureControlToken(stateDir)
@@ -335,6 +350,9 @@ func (a *Agent) writeDaemonHealth(h DaemonHealth) {
 	h.Updated = time.Now()
 	b, _ := json.MarshalIndent(h, "", "  ")
 	_ = os.WriteFile(filepath.Join(a.stateDir, "daemon-health.json"), b, 0600)
+	a.mu.Lock()
+	a.writeUIStateLocked(&h)
+	a.mu.Unlock()
 }
 
 func (a *Agent) printDoctor() {
@@ -408,6 +426,83 @@ func ensureControlToken(stateDir string) (string, error) {
 func (a *Agent) saveConfig() error {
 	b, _ := json.MarshalIndent(a.cfg, "", "  ")
 	return os.WriteFile(a.cfgPath, b, 0600)
+}
+
+type UIState struct {
+	Version          string    `json:"version"`
+	Updated          time.Time `json:"updated"`
+	DeviceTrusted    bool      `json:"device_trusted"`
+	OwnerPresent     bool      `json:"owner_present"`
+	AuthorityEnabled bool      `json:"authority_enabled"`
+	TransportOnline  bool      `json:"transport_online"`
+	Transport        string    `json:"transport"`
+	HostFingerprint  string    `json:"host_fingerprint"`
+	IdentityProvider string    `json:"identity_provider"`
+	PhoneFingerprint string    `json:"phone_fingerprint,omitempty"`
+	PhoneLabel       string    `json:"phone_label,omitempty"`
+	PairVerification string    `json:"pair_verification"`
+	LastSeen         time.Time `json:"last_seen,omitempty"`
+}
+
+func (a *Agent) anyPresentLocked() bool {
+	for _, s := range a.sessions {
+		if s.Trusted && s.UserPresent {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) writeUIStateLocked(health *DaemonHealth) {
+	st := UIState{Version: version, Updated: time.Now(), HostFingerprint: a.hostFP, IdentityProvider: a.identity.Provider(), PairVerification: pairCodeFromFingerprint(a.hostFP), Transport: "Offline"}
+	var newest Session
+	for _, s := range a.sessions {
+		if s.Trusted {
+			st.DeviceTrusted = true
+		}
+		if s.UserPresent {
+			st.OwnerPresent = true
+		}
+		if newest.LastSeen.IsZero() || s.LastSeen.After(newest.LastSeen) {
+			newest = s
+		}
+	}
+	st.AuthorityEnabled = st.DeviceTrusted && st.OwnerPresent
+	if !newest.LastSeen.IsZero() {
+		st.PhoneFingerprint = newest.PhoneFingerprint
+		st.LastSeen = newest.LastSeen
+		st.PhoneLabel = a.cfg.DeviceLabels[newest.PhoneFingerprint]
+		if st.PhoneLabel == "" {
+			st.PhoneLabel = "Owner phone"
+		}
+	}
+	var h DaemonHealth
+	if health != nil {
+		h = *health
+	} else if raw, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
+		_ = json.Unmarshal(raw, &h)
+	}
+	if !h.Updated.IsZero() && time.Since(h.Updated) < 8*time.Second {
+		if len(h.Devices) > 0 && len(h.ReverseOK) > 0 {
+			st.TransportOnline = true
+			st.Transport = "USB"
+		} else if h.ADBAvailable {
+			st.Transport = "Recovering"
+		}
+	}
+	b, _ := json.MarshalIndent(st, "", "  ")
+	_ = os.WriteFile(filepath.Join(a.stateDir, "ui-state.json"), b, 0600)
+}
+
+func (a *Agent) printUIState() {
+	a.mu.Lock()
+	a.writeUIStateLocked(nil)
+	a.mu.Unlock()
+	if b, err := os.ReadFile(filepath.Join(a.stateDir, "ui-state.json")); err == nil {
+		fmt.Println(string(b))
+		return
+	}
+	fmt.Println(`{"device_trusted":false,"owner_present":false,"authority_enabled":false,"transport_online":false,"transport":"Offline"}`)
 }
 
 func (a *Agent) printStatus() {
@@ -612,6 +707,12 @@ func (a *Agent) handle(c net.Conn) {
 	}
 	if !paired && a.pairOnce {
 		a.cfg.PairedPhones[phoneFP] = phonePubHex
+		if a.cfg.DeviceLabels == nil {
+			a.cfg.DeviceLabels = map[string]string{}
+		}
+		if a.cfg.DeviceLabels[phoneFP] == "" {
+			a.cfg.DeviceLabels[phoneFP] = "Owner phone"
+		}
 		a.pairOnce = false
 		_ = a.saveConfig()
 		paired = true
@@ -710,11 +811,14 @@ func (a *Agent) handle(c net.Conn) {
 func (a *Agent) sessionUp(live *liveSession) {
 	a.mu.Lock()
 	wasEmpty := len(a.sessions) == 0
+	wasPresent := a.anyPresentLocked()
 	now := time.Now()
 	a.live[live.phoneFP] = live
 	a.sessions[live.phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: live.phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation", HostIdentityProvider: a.identity.Provider(), UserPresent: live.userPresent}
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
+	a.writeUIStateLocked(nil)
+	nowPresent := a.anyPresentLocked()
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
 	p := live.userPresent
@@ -724,9 +828,13 @@ func (a *Agent) sessionUp(live *liveSession) {
 	if wasEmpty {
 		runHook(a.onTrust)
 	}
+	if !wasPresent && nowPresent {
+		runHook(a.onPresence)
+	}
 }
 func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 	a.mu.Lock()
+	wasPresent := a.anyPresentLocked()
 	if a.lastPresence == nil {
 		a.lastPresence = map[string]bool{}
 	}
@@ -741,6 +849,8 @@ func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 	a.sessions[phoneFP] = s
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
+	a.writeUIStateLocked(nil)
+	nowPresent := a.anyPresentLocked()
 	a.mu.Unlock()
 	if !hadOld || old != userPresent {
 		p := userPresent
@@ -750,18 +860,30 @@ func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 			a.recordEvent("owner-presence", "info", "Owner authority suspended", "Phone locked; device trust remains active, owner proofs are denied.", phoneFP, &p)
 		}
 	}
+	if !wasPresent && nowPresent {
+		runHook(a.onPresence)
+	}
+	if wasPresent && !nowPresent {
+		runHook(a.onAbsence)
+	}
 }
 func (a *Agent) sessionDown(phoneFP string) {
 	a.mu.Lock()
+	wasPresent := a.anyPresentLocked()
 	delete(a.sessions, phoneFP)
 	delete(a.live, phoneFP)
 	delete(a.lastPresence, phoneFP)
 	nowEmpty := len(a.sessions) == 0
+	nowPresent := a.anyPresentLocked()
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
+	a.writeUIStateLocked(nil)
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session DOWN phone=%s\n", phoneFP)
 	a.recordEvent("device-trust-lost", "info", "Device trust ended", "Authenticated transport session ended.", phoneFP, nil)
+	if wasPresent && !nowPresent {
+		runHook(a.onAbsence)
+	}
 	if nowEmpty {
 		runHook(a.onUntrust)
 	}
@@ -801,6 +923,59 @@ func (a *Agent) writeOwnerModeLocked() {
 	m := map[string]any{"trusted": true, "user_present": true, "policy": "owner-workstation", "host_fingerprint": a.hostFP, "phone_fingerprint": newest.PhoneFingerprint, "identity_provider": a.identity.Provider(), "since": newest.Since, "last_seen": newest.LastSeen, "control": "local-authenticated"}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	_ = os.WriteFile(p, b, 0600)
+}
+
+func runDeviceCLI(a *Agent, args []string) {
+	if len(args) == 0 || args[0] == "list" {
+		fps := make([]string, 0, len(a.cfg.PairedPhones))
+		for fp := range a.cfg.PairedPhones {
+			fps = append(fps, fp)
+		}
+		sort.Strings(fps)
+		for _, fp := range fps {
+			label := a.cfg.DeviceLabels[fp]
+			if label == "" {
+				label = "Owner phone"
+			}
+			fmt.Printf("%s\t%s\n", fp, label)
+		}
+		return
+	}
+	fs := flag.NewFlagSet("device "+args[0], flag.ExitOnError)
+	fp := fs.String("fingerprint", "", "paired phone fingerprint")
+	name := fs.String("name", "", "friendly device name")
+	_ = fs.Parse(args[1:])
+	key := strings.TrimSpace(*fp)
+	if key == "" {
+		fatal(errors.New("--fingerprint is required"))
+	}
+	if _, ok := a.cfg.PairedPhones[key]; !ok {
+		fatal(errors.New("device is not paired"))
+	}
+	switch args[0] {
+	case "rename":
+		n := strings.TrimSpace(*name)
+		if n == "" {
+			fatal(errors.New("--name is required"))
+		}
+		if a.cfg.DeviceLabels == nil {
+			a.cfg.DeviceLabels = map[string]string{}
+		}
+		a.cfg.DeviceLabels[key] = n
+		if err := a.saveConfig(); err != nil {
+			fatal(err)
+		}
+		fmt.Println("Renamed device to", n)
+	case "revoke":
+		delete(a.cfg.PairedPhones, key)
+		delete(a.cfg.DeviceLabels, key)
+		if err := a.saveConfig(); err != nil {
+			fatal(err)
+		}
+		fmt.Println("Revoked device", key)
+	default:
+		fatal(errors.New("usage: device [list|rename|revoke]"))
+	}
 }
 
 func runHook(command string) {
