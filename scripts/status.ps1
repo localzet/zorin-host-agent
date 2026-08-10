@@ -18,6 +18,7 @@ try {
         $desc = switch ($hex) {
             '0x00000000' { 'success' }
             '0xC000013A' { 'stopped by Ctrl+C / console close' }
+            '0x00041306' { 'previous scheduled-task run was terminated by user/operator' }
             default { 'see Windows Task Scheduler result code' }
         }
         Write-Host "  Last run: $($Info.LastRunTime) / $hex ($desc)"
@@ -42,3 +43,5 @@ else {
     }
 }
 & $Exe status
+
+Write-Host 'Tip: run 11-DOCTOR.bat for live ADB/reverse/TrustService checks.' -ForegroundColor DarkGray

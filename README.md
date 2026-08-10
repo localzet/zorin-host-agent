@@ -37,3 +37,8 @@ From v0.2.2, device trust survives screen lock. `session.json` therefore means *
 ### v0.3 service + visual lifecycle
 
 Known paired-host reconnects now start the phone's foreground `TrustService` directly through ADB shell instead of launching the UI Activity. After mutual authentication succeeds, the agent requests one predefined red owner-trust pulse. Pairing remains the only normal flow that intentionally opens the TRUST UI.
+
+
+## ADB reliability
+
+The daemon persists an absolute `adb.exe` path and scheduled startup passes it explicitly with `--adb`. Use `zorin-host-agent doctor` (or `11-DOCTOR.bat` from the Windows bundle) to inspect ADB device state, reverse mappings, Runtime PID, and TrustService presence.

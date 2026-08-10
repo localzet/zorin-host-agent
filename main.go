@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.3.1"
+	version      = "0.3.3"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -36,6 +36,17 @@ const (
 
 type Config struct {
 	PairedPhones map[string]string `json:"paired_phones"`
+	ADBPath      string            `json:"adb_path,omitempty"`
+}
+
+type DaemonHealth struct {
+	Updated          time.Time `json:"updated"`
+	ADBPath          string    `json:"adb_path,omitempty"`
+	ADBAvailable     bool      `json:"adb_available"`
+	Devices          []string  `json:"devices,omitempty"`
+	ReverseOK        []string  `json:"reverse_ok,omitempty"`
+	LastServiceStart string    `json:"last_service_start,omitempty"`
+	LastError        string    `json:"last_error,omitempty"`
 }
 
 type Session struct {
@@ -77,6 +88,7 @@ type Agent struct {
 	onTrust      string
 	onUntrust    string
 	adbSerial    string
+	adbPath      string
 	controlToken string
 
 	mu       sync.Mutex
@@ -106,15 +118,24 @@ func main() {
 		onUntrust := fs.String("on-untrust", "", "optional local command to run when the last trusted USB session disappears")
 		noADB := fs.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
 		serial := fs.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
+		adbPath := fs.String("adb", "", "absolute path to adb executable; persisted for autostart reliability")
 		_ = fs.Parse(args)
 		a.pairOnce = *pairOnce
 		a.onTrust = *onTrust
 		a.onUntrust = *onUntrust
 		a.adbSerial = strings.TrimSpace(*serial)
+		if err := a.configureADB(strings.TrimSpace(*adbPath)); err != nil {
+			fmt.Fprintf(os.Stderr, "ADB unavailable: %v\n", err)
+		}
 		fmt.Printf("Zorin Host Agent %s\n", version)
 		fmt.Printf("Host identity: %s\n", a.hostFP)
 		fmt.Printf("Identity provider: %s\n", a.identity.Provider())
 		fmt.Printf("Trust listen: %s\nControl API: %s\n", listenAddr, controlAddr)
+		if a.adbPath != "" {
+			fmt.Printf("ADB executable: %s\n", a.adbPath)
+		} else {
+			fmt.Println("ADB executable: NOT FOUND")
+		}
 		if a.adbSerial != "" {
 			fmt.Printf("ADB target: %s\n", a.adbSerial)
 		}
@@ -133,7 +154,11 @@ func main() {
 			fatal(err)
 		}
 	case "status":
+		_ = a.configureADB("")
 		a.printStatus()
+	case "doctor":
+		_ = a.configureADB("")
+		a.printDoctor()
 	case "fingerprint":
 		fmt.Println(a.hostFP)
 	case "policy":
@@ -158,7 +183,7 @@ func main() {
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|authorize|credential|gate|policy|identity|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|doctor|authorize|credential|gate|policy|identity|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 }
@@ -190,7 +215,121 @@ func loadAgent() (*Agent, error) {
 		return nil, err
 	}
 	_, _ = ensurePolicy(stateDir)
-	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}}, nil
+	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, adbPath: strings.TrimSpace(cfg.ADBPath), controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}}, nil
+}
+
+func (a *Agent) configureADB(explicit string) error {
+	candidates := []string{}
+	if strings.TrimSpace(explicit) != "" {
+		candidates = append(candidates, strings.TrimSpace(explicit))
+	}
+	if strings.TrimSpace(a.adbPath) != "" {
+		candidates = append(candidates, strings.TrimSpace(a.adbPath))
+	}
+	if strings.TrimSpace(a.cfg.ADBPath) != "" {
+		candidates = append(candidates, strings.TrimSpace(a.cfg.ADBPath))
+	}
+	if p, err := exec.LookPath("adb"); err == nil {
+		candidates = append(candidates, p)
+	}
+	seen := map[string]bool{}
+	for _, c := range candidates {
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		abs, err := filepath.Abs(c)
+		if err == nil {
+			c = abs
+		}
+		st, err := os.Stat(c)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		a.adbPath = c
+		if a.cfg.ADBPath != c {
+			a.cfg.ADBPath = c
+			_ = a.saveConfig()
+		}
+		return nil
+	}
+	a.adbPath = ""
+	if strings.TrimSpace(explicit) != "" {
+		return fmt.Errorf("configured adb does not exist: %s", explicit)
+	}
+	return errors.New("adb executable not found; reinstall autostart from a shell where adb is available")
+}
+
+func (a *Agent) adbCommand(args ...string) (*exec.Cmd, error) {
+	if strings.TrimSpace(a.adbPath) == "" {
+		if err := a.configureADB(""); err != nil {
+			return nil, err
+		}
+	}
+	return exec.Command(a.adbPath, args...), nil
+}
+
+func (a *Agent) writeDaemonHealth(h DaemonHealth) {
+	h.Updated = time.Now()
+	b, _ := json.MarshalIndent(h, "", "  ")
+	_ = os.WriteFile(filepath.Join(a.stateDir, "daemon-health.json"), b, 0600)
+}
+
+func (a *Agent) printDoctor() {
+	fmt.Println("Zorin Host Agent doctor")
+	if a.adbPath == "" {
+		fmt.Println("ADB: NOT FOUND")
+		return
+	}
+	fmt.Printf("ADB: %s\n", a.adbPath)
+	cmd, err := a.adbCommand("devices")
+	if err != nil {
+		fmt.Println("adb devices:", err)
+		return
+	}
+	out, err := cmd.CombinedOutput()
+	fmt.Printf("adb devices:\n%s", string(out))
+	if err != nil {
+		fmt.Printf("ERROR: %v\n", err)
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] != "device" {
+			continue
+		}
+		serial := f[0]
+		if a.adbSerial != "" && serial != a.adbSerial {
+			continue
+		}
+		fmt.Printf("\n[%s]\n", serial)
+		if c, e := a.adbCommand("-s", serial, "reverse", "--list"); e == nil {
+			o, er := c.CombinedOutput()
+			fmt.Printf("reverse --list: %s", string(o))
+			if er != nil {
+				fmt.Printf("ERROR %v\n", er)
+			}
+		}
+		if c, e := a.adbCommand("-s", serial, "shell", "pidof", androidPkg); e == nil {
+			o, er := c.CombinedOutput()
+			fmt.Printf("runtime pid: %s", string(o))
+			if er != nil {
+				fmt.Printf("not running (%v)\n", er)
+			}
+		}
+		if c, e := a.adbCommand("-s", serial, "shell", "dumpsys", "activity", "services", androidPkg); e == nil {
+			o, _ := c.CombinedOutput()
+			text := string(o)
+			if strings.Contains(text, "TrustService") {
+				fmt.Println("TrustService: PRESENT in ActivityManager")
+			} else {
+				fmt.Println("TrustService: NOT PRESENT in ActivityManager")
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
+		fmt.Printf("\nLast daemon health:\n%s\n", b)
+	}
 }
 
 func ensureControlToken(stateDir string) (string, error) {
@@ -222,6 +361,14 @@ func (a *Agent) printStatus() {
 	}
 	fmt.Printf("Policy: %s\n", filepath.Join(a.stateDir, "policy.json"))
 	fmt.Printf("Control API: %s (token file protected in state dir)\n", controlAddr)
+	if a.adbPath != "" {
+		fmt.Printf("ADB executable: %s\n", a.adbPath)
+	} else {
+		fmt.Println("ADB executable: NOT FOUND")
+	}
+	if b, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
+		fmt.Printf("Daemon health:\n%s\n", b)
+	}
 	if b, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
 		fmt.Printf("Active state:\n%s\n", b)
 	} else {
@@ -554,26 +701,35 @@ func (a *Agent) startTrustService(serial string, pulse bool) error {
 	if pulse {
 		args = append(args, "--ez", "dev.zorin.trust.pulse", "true")
 	}
-	out, err := exec.Command("adb", args...).CombinedOutput()
+	cmd, e := a.adbCommand(args...)
+	if e != nil {
+		return e
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("TrustService start failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-func (a *Agent) wakeAndroid(serial string, visible bool) {
+func (a *Agent) wakeAndroid(serial string, visible bool) error {
 	// Known hosts no longer wake the Activity. The foreground TrustService owns the
 	// persistent runtime and survives UI removal from Recents.
+	var startErr error
 	if err := a.startTrustService(serial, false); err != nil {
+		startErr = err
 		fmt.Fprintln(os.Stderr, "trust service:", err)
 	}
 	if visible {
 		args := []string{"-s", serial, "shell", "am", "start", "-n", androidPkg + "/" + androidAct, "--ez", "dev.zorin.trust.autoconnect", "true"}
-		_ = exec.Command("adb", args...).Run()
+		if cmd, e := a.adbCommand(args...); e == nil {
+			_ = cmd.Run()
+		}
 	}
 	a.mu.Lock()
 	a.lastWake[serial] = time.Now()
 	a.mu.Unlock()
+	return startErr
 }
 
 func (a *Agent) pulseOwnerVisual() {
@@ -626,11 +782,25 @@ func (a *Agent) adbWatcher() {
 	}
 }
 func (a *Agent) adbSweep() {
-	if _, err := exec.LookPath("adb"); err != nil {
+	h := DaemonHealth{ADBPath: a.adbPath}
+	if err := a.configureADB(""); err != nil {
+		h.ADBAvailable = false
+		h.LastError = err.Error()
+		a.writeDaemonHealth(h)
 		return
 	}
-	out, err := exec.Command("adb", "devices").Output()
+	h.ADBPath = a.adbPath
+	h.ADBAvailable = true
+	cmd, e := a.adbCommand("devices")
+	if e != nil {
+		h.LastError = e.Error()
+		a.writeDaemonHealth(h)
+		return
+	}
+	out, err := cmd.Output()
 	if err != nil {
+		h.LastError = "adb devices: " + err.Error()
+		a.writeDaemonHealth(h)
 		return
 	}
 	current := map[string]bool{}
@@ -644,18 +814,38 @@ func (a *Agent) adbSweep() {
 			continue
 		}
 		current[serial] = true
-		_ = exec.Command("adb", "-s", serial, "reverse", "tcp:47472", "tcp:47472").Run()
+		h.Devices = append(h.Devices, serial)
+		rc, ce := a.adbCommand("-s", serial, "reverse", "tcp:47472", "tcp:47472")
+		reverseOK := false
+		if ce == nil {
+			if o, er := rc.CombinedOutput(); er == nil {
+				reverseOK = true
+				h.ReverseOK = append(h.ReverseOK, serial)
+			} else {
+				h.LastError = fmt.Sprintf("adb reverse %s: %v (%s)", serial, er, strings.TrimSpace(string(o)))
+			}
+		}
 		a.mu.Lock()
 		first := !a.seenADB[serial]
 		a.seenADB[serial] = true
 		a.mu.Unlock()
 		if first {
-			fmt.Printf("ADB device connected: %s; reverse installed\n", serial)
+			fmt.Printf("ADB device connected: %s; reverse=%v\n", serial, reverseOK)
 		}
+		wake := false
+		visible := false
 		if a.pairOnce && first {
-			a.wakeAndroid(serial, true)
+			wake = true
+			visible = true
 		} else if a.shouldHeadlessWake(serial, first) {
-			a.wakeAndroid(serial, false)
+			wake = true
+		}
+		if wake {
+			err := a.wakeAndroid(serial, visible)
+			h.LastServiceStart = time.Now().Format(time.RFC3339)
+			if err != nil {
+				h.LastError = err.Error()
+			}
 		}
 	}
 	a.mu.Lock()
@@ -667,7 +857,9 @@ func (a *Agent) adbSweep() {
 		}
 	}
 	a.mu.Unlock()
+	a.writeDaemonHealth(h)
 }
+
 func sanitize(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' {

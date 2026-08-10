@@ -1,3 +1,17 @@
+## 0.3.3
+
+- Persist an absolute ADB executable path for Scheduled Task startup.
+- Add daemon-health diagnostics and `doctor`.
+- Report ADB device/reverse/bootstrap failures instead of silently ignoring them.
+- Pair with Runtime 5.0.3, whose TrustService is isolated from the UI process.
+
+## 0.3.2
+
+- Persist the absolute adb executable path instead of relying on Scheduled Task PATH.
+- Add daemon-health.json with ADB device/reverse/service bootstrap health.
+- Add `doctor` diagnostics for ADB reverse and Android TrustService presence.
+- Decode Task Scheduler 0x00041306 in Windows status output.
+
 ## 0.3.1
 - Headless reconnect remains service-only; the Activity is never started outside explicit pairing.
 - Increase failed headless bootstrap retry interval to 30s to prevent process-crash thrash.
