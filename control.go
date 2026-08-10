@@ -15,10 +15,13 @@ import (
 )
 
 type controlRequest struct {
-	Token    string `json:"token"`
-	Op       string `json:"op"`
-	Action   string `json:"action,omitempty"`
-	Resource string `json:"resource,omitempty"`
+	Token     string `json:"token"`
+	Op        string `json:"op"`
+	Action    string `json:"action,omitempty"`
+	Resource  string `json:"resource,omitempty"`
+	Prompt    string `json:"prompt,omitempty"`
+	Explicit  bool   `json:"explicit,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type controlResponse struct {
@@ -46,7 +49,9 @@ func (a *Agent) serveControl() error {
 
 func (a *Agent) handleControl(c net.Conn) {
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(12 * time.Second))
+	// Explicit phone approvals are deliberately human-paced. Keep the local
+	// control connection bounded, but long enough for unlock + confirmation.
+	_ = c.SetDeadline(time.Now().Add(75 * time.Second))
 	var req controlRequest
 	if err := json.NewDecoder(c).Decode(&req); err != nil {
 		_ = json.NewEncoder(c).Encode(controlResponse{Error: "malformed request"})
@@ -58,7 +63,7 @@ func (a *Agent) handleControl(c net.Conn) {
 	}
 	switch req.Op {
 	case "authorize":
-		resp := a.authorize(req.Action, req.Resource)
+		resp := a.authorizeDetailed(req.Action, req.Resource, req.Prompt, req.RequestID, req.Explicit)
 		_ = json.NewEncoder(c).Encode(resp)
 	case "status":
 		a.mu.Lock()
@@ -84,11 +89,24 @@ func (a *Agent) handleControl(c net.Conn) {
 }
 
 func (a *Agent) authorize(action, resource string) controlResponse {
+	return a.authorizeDetailed(action, resource, "", "", false)
+}
+
+func (a *Agent) authorizeDetailed(action, resource, prompt, requestID string, explicit bool) controlResponse {
 	action = strings.TrimSpace(action)
 	resource = strings.TrimSpace(resource)
+	prompt = strings.TrimSpace(prompt)
+	requestID = strings.TrimSpace(requestID)
 	if action == "" || resource == "" {
 		return controlResponse{Error: "action and resource are required"}
 	}
+	if requestID == "" {
+		requestID = randomHex(16)
+	}
+	if len(prompt) > 360 {
+		prompt = prompt[:360]
+	}
+
 	a.mu.Lock()
 	trusted := len(a.live) > 0
 	var live *liveSession
@@ -103,40 +121,106 @@ func (a *Agent) authorize(action, resource string) controlResponse {
 	}
 	present := live != nil && live.userPresent
 	a.mu.Unlock()
+
 	cfg := loadPolicy(a.stateDir)
 	d := evaluatePolicy(cfg, action, resource, trusted)
 	if !d.Allowed {
-		a.recordEvent("authority-denied", "warning", "Owner action denied", action+" -> "+resource+": "+d.Reason, "", nil)
+		a.recordEvent("authority-denied", "warning", "Action denied", action+" -> "+resource+": "+d.Reason, "", nil)
 		return controlResponse{OK: true, Allowed: false, Reason: d.Reason}
 	}
 	if live == nil {
 		return controlResponse{OK: true, Allowed: false, Reason: "trusted session disappeared"}
 	}
-	if !present {
-		a.recordEvent("authority-denied", "info", "Owner action blocked while locked", action+" -> "+resource, live.phoneFP, nil)
+	// Presence-only grants remain instant. Explicit grants are allowed to wait
+	// while the phone is locked; the phone itself refuses to sign until it is
+	// unlocked and the user taps Authorize.
+	if !explicit && !present {
+		a.recordEvent("authority-denied", "info", "Action paused while phone is locked", action+" -> "+resource, live.phoneFP, nil)
 		return controlResponse{OK: true, Allowed: false, Reason: "owner presence required: phone is locked"}
 	}
+
 	ttl := 30
 	if d.Rule != nil && d.Rule.ProofTTLSeconds > 0 {
 		ttl = d.Rule.ProofTTLSeconds
 	}
-	pr := proofRequest{action: action, resource: resource, ttl: ttl, result: make(chan proofResult, 1)}
+	if explicit {
+		a.recordEvent("approval-requested", "info", "Approval requested", promptOrAction(prompt, action), live.phoneFP, nil)
+		go a.wakeApprovalActivity()
+	}
+	pr := proofRequest{action: action, resource: resource, ttl: ttl, requestID: requestID, prompt: prompt, explicit: explicit, result: make(chan proofResult, 1)}
 	select {
 	case live.req <- pr:
 	case <-time.After(2 * time.Second):
 		return controlResponse{Error: "phone proof queue unavailable"}
 	}
+	wait := 8 * time.Second
+	if explicit {
+		wait = 55 * time.Second
+	}
 	select {
 	case r := <-pr.result:
 		if r.err != nil {
-			a.recordEvent("proof-error", "warning", "Owner proof failed", r.err.Error(), live.phoneFP, nil)
+			sev := "warning"
+			if strings.Contains(strings.ToLower(r.err.Error()), "denied") {
+				sev = "info"
+			}
+			a.recordEvent("proof-error", sev, "Approval not granted", r.err.Error(), live.phoneFP, nil)
 			return controlResponse{Error: r.err.Error()}
 		}
-		a.recordEvent("proof-issued", "success", "Owner proof issued", action+" -> "+resource, live.phoneFP, nil)
+		title := "Owner proof issued"
+		if explicit {
+			title = "Action approved"
+		}
+		a.recordEvent("proof-issued", "success", title, action+" -> "+resource, live.phoneFP, nil)
 		return controlResponse{OK: true, Allowed: true, Reason: d.Reason, Proof: &r.proof}
-	case <-time.After(7 * time.Second):
-		return controlResponse{Error: "phone proof request timed out"}
+	case <-time.After(wait):
+		return controlResponse{Error: "phone approval timed out"}
 	}
+}
+
+func promptOrAction(prompt, action string) string {
+	if strings.TrimSpace(prompt) != "" {
+		return prompt
+	}
+	return action
+}
+
+func (a *Agent) wakeApprovalActivity() {
+	if strings.TrimSpace(a.adbPath) == "" {
+		_ = a.configureADB("")
+	}
+	if strings.TrimSpace(a.adbPath) == "" {
+		return
+	}
+	serials := a.currentADBDevices()
+	if len(serials) != 1 {
+		return
+	}
+	cmd, err := a.adbCommand("-s", serials[0], "shell", "am", "start", "-n", androidPkg+"/"+androidAct, "--ez", "dev.zorin.approval", "true")
+	if err == nil {
+		_ = cmd.Run()
+	}
+}
+
+func (a *Agent) currentADBDevices() []string {
+	cmd, err := a.adbCommand("devices")
+	if err != nil {
+		return nil
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var serials []string
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[1] == "device" {
+			if a.adbSerial == "" || a.adbSerial == f[0] {
+				serials = append(serials, f[0])
+			}
+		}
+	}
+	return serials
 }
 
 func requestControl(a *Agent, req controlRequest) (controlResponse, error) {
@@ -146,7 +230,11 @@ func requestControl(a *Agent, req controlRequest) (controlResponse, error) {
 		return controlResponse{}, fmt.Errorf("host agent control API is not running: %w", err)
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	timeout := 12 * time.Second
+	if req.Explicit {
+		timeout = 70 * time.Second
+	}
+	_ = c.SetDeadline(time.Now().Add(timeout))
 	if err := json.NewEncoder(c).Encode(req); err != nil {
 		return controlResponse{}, err
 	}
@@ -164,10 +252,12 @@ func runAuthorizeCLI(a *Agent, args []string) {
 	fs := flag.NewFlagSet("authorize", flag.ExitOnError)
 	action := fs.String("action", "owner.session", "policy action")
 	resource := fs.String("resource", "local:workstation", "policy resource")
+	prompt := fs.String("prompt", "", "human-readable phone approval prompt")
+	explicit := fs.Bool("explicit", false, "require an explicit on-phone approval")
 	out := fs.String("out", "", "optional file for signed owner proof JSON")
 	compact := fs.Bool("compact", false, "print compact JSON")
 	_ = fs.Parse(args)
-	resp, err := requestControl(a, controlRequest{Op: "authorize", Action: *action, Resource: *resource})
+	resp, err := requestControl(a, controlRequest{Op: "authorize", Action: *action, Resource: *resource, Prompt: *prompt, Explicit: *explicit})
 	if err != nil {
 		fatal(err)
 	}
@@ -211,12 +301,14 @@ func runGateCLI(a *Agent, args []string) {
 	fs := flag.NewFlagSet("gate", flag.ExitOnError)
 	action := fs.String("action", "owner.console", "policy action")
 	resource := fs.String("resource", "local:owner-console", "policy resource")
+	explicit := fs.Bool("explicit", false, "require explicit phone approval")
+	prompt := fs.String("prompt", "", "human-readable phone approval prompt")
 	_ = fs.Parse(flagArgs)
 	if len(cmdArgs) == 0 {
 		fmt.Fprintln(os.Stderr, "gate requires '-- <command> [args...]'")
 		os.Exit(2)
 	}
-	resp, err := requestControl(a, controlRequest{Op: "authorize", Action: *action, Resource: *resource})
+	resp, err := requestControl(a, controlRequest{Op: "authorize", Action: *action, Resource: *resource, Explicit: *explicit, Prompt: *prompt})
 	if err != nil {
 		fatal(err)
 	}

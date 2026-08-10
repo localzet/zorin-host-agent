@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.5.0"
+	version      = "0.6.0"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -72,10 +72,13 @@ type Session struct {
 }
 
 type proofRequest struct {
-	action   string
-	resource string
-	ttl      int
-	result   chan proofResult
+	action    string
+	resource  string
+	ttl       int
+	requestID string
+	prompt    string
+	explicit  bool
+	result    chan proofResult
 }
 type proofResult struct {
 	proof OwnerProof
@@ -777,7 +780,16 @@ func (a *Agent) handle(c net.Conn) {
 			nonce := randomHex(32)
 			ah := hex.EncodeToString([]byte(pr.action))
 			rh := hex.EncodeToString([]byte(pr.resource))
-			if writeLines(c, "PROOF_REQUEST", "ACTION_HEX "+ah, "RESOURCE_HEX "+rh, "NONCE "+nonce, "ISSUED "+strconv.FormatInt(issued, 10), "EXPIRES "+strconv.FormatInt(expires, 10), "END") != nil {
+			ph := hex.EncodeToString([]byte(pr.prompt))
+			mode := "PRESENCE"
+			if pr.explicit {
+				mode = "EXPLICIT"
+			}
+			requestID := sanitize(pr.requestID)
+			if requestID == "" {
+				requestID = randomHex(16)
+			}
+			if writeLines(c, "PROOF_REQUEST", "REQUEST_ID "+requestID, "MODE "+mode, "PROMPT_HEX "+ph, "ACTION_HEX "+ah, "RESOURCE_HEX "+rh, "NONCE "+nonce, "ISSUED "+strconv.FormatInt(issued, 10), "EXPIRES "+strconv.FormatInt(expires, 10), "END") != nil {
 				pr.result <- proofResult{err: errors.New("phone connection lost")}
 				return
 			}

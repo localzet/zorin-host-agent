@@ -29,10 +29,15 @@ type PolicyDecision struct {
 }
 
 func defaultPolicy() PolicyConfig {
-	return PolicyConfig{Version: 1, DefaultEffect: "deny", Rules: []PolicyRule{
+	return PolicyConfig{Version: 4, DefaultEffect: "deny", Rules: []PolicyRule{
 		{Action: "owner.session", Resource: "*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 30},
 		{Action: "owner.console", Resource: "local:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 30},
 		{Action: "credential.owner-proof", Resource: "*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "authority.authorize", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "authority.authorize", Resource: "zauth:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "ops.terminal", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
+		{Action: "ops.docker.*", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
+		{Action: "ops.docker.*", Resource: "vps:*/container:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
 		{Action: "credential.ssh", Resource: "server:*", Effect: "deny", RequireTrust: true, ProofTTLSeconds: 60},
 	}}
 }
@@ -42,6 +47,44 @@ func ensurePolicy(stateDir string) (PolicyConfig, error) {
 	if b, err := os.ReadFile(p); err == nil {
 		var cfg PolicyConfig
 		if json.Unmarshal(b, &cfg) == nil && cfg.Version > 0 {
+			changed := false
+			if cfg.Version < 2 {
+				// Add only the new v0.6 capabilities. Existing user rules keep their
+				// order and therefore continue to override later defaults.
+				cfg.Rules = append(cfg.Rules,
+					PolicyRule{Action: "authority.authorize", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+					PolicyRule{Action: "ops.terminal", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
+					PolicyRule{Action: "ops.docker.*", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
+				)
+				cfg.Version = 2
+				changed = true
+			}
+			if cfg.Version < 3 {
+				// ZAUTH/1 binds the complete transaction into a hash-scoped
+				// authority resource instead of exposing project identifiers in the
+				// phone-proof policy namespace. Keep project:* above for compatibility
+				// with early v0.6 development builds.
+				cfg.Rules = append(cfg.Rules,
+					PolicyRule{Action: "authority.authorize", Resource: "zauth:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+				)
+				cfg.Version = 3
+				changed = true
+			}
+			if cfg.Version < 4 {
+				// Docker resources include a slash-delimited container segment. Go's
+				// path.Match does not let '*' cross '/', so the original vps:* rule
+				// was insufficient for vps:<id>/container:<name>.
+				cfg.Rules = append(cfg.Rules,
+					PolicyRule{Action: "ops.docker.*", Resource: "vps:*/container:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
+				)
+				cfg.Version = 4
+				changed = true
+			}
+			if changed {
+				if out, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+					_ = os.WriteFile(p, out, 0600)
+				}
+			}
 			return cfg, nil
 		}
 	}
