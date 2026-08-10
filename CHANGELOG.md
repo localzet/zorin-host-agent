@@ -1,3 +1,9 @@
+## 0.3.4.1 tooling hotfix
+
+- Fix Windows Runtime owner-signing: do not feed the same one-line password file to both `--ks-pass` and `--key-pass`.
+- Reuse the keystore password for the PKCS#12 key by omitting `--key-pass`.
+- Refuse to silently replace a partially missing owner signer, preserving APK signing continuity.
+
 ## 0.3.3
 
 - Persist an absolute ADB executable path for Scheduled Task startup.
