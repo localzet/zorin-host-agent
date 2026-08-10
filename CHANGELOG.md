@@ -1,3 +1,12 @@
+# Changelog
+
+## 0.4.0
+- Event timeline journal (`events.jsonl`) for transport, trust, presence, pairing and proofs.
+- Human-readable Trust Center state in `status`.
+- Pair verification phrase printed in pairing mode.
+- `host-info.json` snapshot for the Windows Trust Center.
+- Fixed ambiguous-device pulse selection code.
+
 ## 0.3.4.1 tooling hotfix
 
 - Fix Windows Runtime owner-signing: do not feed the same one-line password file to both `--ks-pass` and `--key-pass`.

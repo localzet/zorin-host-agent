@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.3.3"
+	version      = "0.4.0"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -47,6 +47,16 @@ type DaemonHealth struct {
 	ReverseOK        []string  `json:"reverse_ok,omitempty"`
 	LastServiceStart string    `json:"last_service_start,omitempty"`
 	LastError        string    `json:"last_error,omitempty"`
+}
+
+type EventRecord struct {
+	Time        time.Time `json:"time"`
+	Type        string    `json:"type"`
+	Severity    string    `json:"severity"`
+	Title       string    `json:"title"`
+	Detail      string    `json:"detail,omitempty"`
+	Phone       string    `json:"phone_fingerprint,omitempty"`
+	UserPresent *bool     `json:"user_present,omitempty"`
 }
 
 type Session struct {
@@ -91,11 +101,13 @@ type Agent struct {
 	adbPath      string
 	controlToken string
 
-	mu       sync.Mutex
-	sessions map[string]Session
-	live     map[string]*liveSession
-	seenADB  map[string]bool
-	lastWake map[string]time.Time
+	mu           sync.Mutex
+	eventMu      sync.Mutex
+	sessions     map[string]Session
+	live         map[string]*liveSession
+	seenADB      map[string]bool
+	lastWake     map[string]time.Time
+	lastPresence map[string]bool
 }
 
 func main() {
@@ -109,6 +121,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	a.writeHostInfo()
 
 	switch cmd {
 	case "daemon":
@@ -141,6 +154,8 @@ func main() {
 		}
 		if a.pairOnce {
 			fmt.Println("PAIR WINDOW: the next phone approved on-device may be enrolled")
+			fmt.Printf("PAIR VERIFICATION: %s\n", pairCodeFromFingerprint(a.hostFP))
+			a.recordEvent("pair-window", "info", "Pairing window opened", "Compare the verification code on Windows and the phone before approving.", "", nil)
 		}
 		if !*noADB {
 			go a.adbWatcher()
@@ -215,7 +230,7 @@ func loadAgent() (*Agent, error) {
 		return nil, err
 	}
 	_, _ = ensurePolicy(stateDir)
-	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, adbPath: strings.TrimSpace(cfg.ADBPath), controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}}, nil
+	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, adbPath: strings.TrimSpace(cfg.ADBPath), controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}, lastPresence: map[string]bool{}}, nil
 }
 
 func (a *Agent) configureADB(explicit string) error {
@@ -267,6 +282,53 @@ func (a *Agent) adbCommand(args ...string) (*exec.Cmd, error) {
 		}
 	}
 	return exec.Command(a.adbPath, args...), nil
+}
+
+func pairCodeFromFingerprint(fp string) string {
+	words := []string{"EMBER", "FALCON", "NOVA", "WOLF", "ORBIT", "ONYX", "PIXEL", "RAVEN", "SOLAR", "TITAN", "VECTOR", "COMET", "PULSE", "ATLAS", "NEXUS", "VAULT"}
+	hexOnly := strings.Map(func(r rune) rune {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'F') || (r >= 'a' && r <= 'f') {
+			return r
+		}
+		return -1
+	}, fp)
+	if len(hexOnly) < 8 {
+		return "UNAVAILABLE"
+	}
+	b, err := hex.DecodeString(hexOnly[:8])
+	if err != nil || len(b) < 4 {
+		return "UNAVAILABLE"
+	}
+	return fmt.Sprintf("%s-%s %02d", words[int(b[0])&15], words[int(b[1])&15], (int(b[2])<<8|int(b[3]))%100)
+}
+
+func (a *Agent) recordEvent(kind, severity, title, detail, phone string, present *bool) {
+	a.eventMu.Lock()
+	defer a.eventMu.Unlock()
+	e := EventRecord{Time: time.Now(), Type: kind, Severity: severity, Title: title, Detail: detail, Phone: phone, UserPresent: present}
+	b, _ := json.Marshal(e)
+	p := filepath.Join(a.stateDir, "events.jsonl")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err == nil {
+		_, _ = f.Write(append(b, '\n'))
+		_ = f.Close()
+	}
+	// Bound the timeline file to ~512 KiB so a long-running workstation never grows it forever.
+	if st, err := os.Stat(p); err == nil && st.Size() > 512*1024 {
+		if data, err := os.ReadFile(p); err == nil {
+			start := len(data) / 2
+			if i := strings.IndexByte(string(data[start:]), '\n'); i >= 0 {
+				start += i + 1
+			}
+			_ = os.WriteFile(p, data[start:], 0600)
+		}
+	}
+}
+
+func (a *Agent) writeHostInfo() {
+	m := map[string]any{"version": version, "host_fingerprint": a.hostFP, "identity_provider": a.identity.Provider(), "protocol": protocolName, "pair_verification": pairCodeFromFingerprint(a.hostFP)}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	_ = os.WriteFile(filepath.Join(a.stateDir, "host-info.json"), b, 0600)
 }
 
 func (a *Agent) writeDaemonHealth(h DaemonHealth) {
@@ -359,25 +421,76 @@ func (a *Agent) printStatus() {
 	for _, fp := range fps {
 		fmt.Printf("  %s\n", fp)
 	}
-	fmt.Printf("Policy: %s\n", filepath.Join(a.stateDir, "policy.json"))
+
+	trusted, present := false, false
+	var sessions []Session
+	if raw, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
+		_ = json.Unmarshal(raw, &sessions)
+		for _, ss := range sessions {
+			if ss.Trusted {
+				trusted = true
+			}
+			if ss.UserPresent {
+				present = true
+			}
+		}
+	}
+	var health DaemonHealth
+	healthFresh := false
+	if raw, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
+		if json.Unmarshal(raw, &health) == nil && !health.Updated.IsZero() {
+			healthFresh = time.Since(health.Updated) < 8*time.Second
+		}
+	}
+	transport := healthFresh && len(health.Devices) > 0 && len(health.ReverseOK) > 0
+	transportText := "OFFLINE"
+	if transport {
+		transportText = "USB / ADB"
+	} else if healthFresh && health.ADBAvailable {
+		transportText = "RECOVERING"
+	}
+	presenceText := "ABSENT"
+	if trusted {
+		if present {
+			presenceText = "PRESENT"
+		} else {
+			presenceText = "LOCKED"
+		}
+	}
+	authorityText := "SUSPENDED"
+	if trusted && present {
+		authorityText = "ENABLED"
+	}
+	trustText := "INACTIVE"
+	if trusted {
+		trustText = "ACTIVE"
+	}
+	fmt.Println("\nTrust Center state:")
+	fmt.Printf("  Device trust:   %s\n", trustText)
+	fmt.Printf("  Owner presence: %s\n", presenceText)
+	fmt.Printf("  Owner actions:  %s\n", authorityText)
+	fmt.Printf("  Transport:      %s\n", transportText)
+	fmt.Printf("  Pair code:      %s\n", pairCodeFromFingerprint(a.hostFP))
+
+	fmt.Printf("\nPolicy: %s\n", filepath.Join(a.stateDir, "policy.json"))
 	fmt.Printf("Control API: %s (token file protected in state dir)\n", controlAddr)
 	if a.adbPath != "" {
 		fmt.Printf("ADB executable: %s\n", a.adbPath)
 	} else {
 		fmt.Println("ADB executable: NOT FOUND")
 	}
-	if b, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
-		fmt.Printf("Daemon health:\n%s\n", b)
-	}
-	if b, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
+	if len(sessions) > 0 {
+		b, _ := json.MarshalIndent(sessions, "", "  ")
 		fmt.Printf("Active state:\n%s\n", b)
 	} else {
 		fmt.Println("Active state: none")
 	}
 	if b, err := os.ReadFile(filepath.Join(a.stateDir, "owner-mode.json")); err == nil {
-		fmt.Printf("Owner mode:\n%s\n", b)
+		fmt.Printf("Owner authority:\n%s\n", b)
+	} else if trusted {
+		fmt.Println("Owner authority: SUSPENDED (phone locked)")
 	} else {
-		fmt.Println("Owner mode: locked")
+		fmt.Println("Owner authority: INACTIVE")
 	}
 }
 
@@ -503,6 +616,7 @@ func (a *Agent) handle(c net.Conn) {
 		_ = a.saveConfig()
 		paired = true
 		fmt.Printf("PAIRED phone %s\n", phoneFP)
+		a.recordEvent("paired", "success", "Phone paired", "Owner workstation enrollment completed.", phoneFP, nil)
 	}
 	a.mu.Unlock()
 	if !paired {
@@ -603,6 +717,8 @@ func (a *Agent) sessionUp(live *liveSession) {
 	a.writeOwnerModeLocked()
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
+	p := live.userPresent
+	a.recordEvent("device-trust", "success", "Device trust established", "Mutual ZTRUST/2 authentication succeeded.", live.phoneFP, &p)
 	// The red pulse is emitted only after mutual cryptographic authentication succeeds.
 	a.pulseOwnerVisual()
 	if wasEmpty {
@@ -611,6 +727,11 @@ func (a *Agent) sessionUp(live *liveSession) {
 }
 func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 	a.mu.Lock()
+	if a.lastPresence == nil {
+		a.lastPresence = map[string]bool{}
+	}
+	old, hadOld := a.lastPresence[phoneFP]
+	a.lastPresence[phoneFP] = userPresent
 	if l := a.live[phoneFP]; l != nil {
 		l.userPresent = userPresent
 	}
@@ -621,16 +742,26 @@ func (a *Agent) sessionTouch(phoneFP string, userPresent bool) {
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
 	a.mu.Unlock()
+	if !hadOld || old != userPresent {
+		p := userPresent
+		if userPresent {
+			a.recordEvent("owner-presence", "success", "Owner presence restored", "Phone unlocked; owner-authorized actions are enabled.", phoneFP, &p)
+		} else {
+			a.recordEvent("owner-presence", "info", "Owner authority suspended", "Phone locked; device trust remains active, owner proofs are denied.", phoneFP, &p)
+		}
+	}
 }
 func (a *Agent) sessionDown(phoneFP string) {
 	a.mu.Lock()
 	delete(a.sessions, phoneFP)
 	delete(a.live, phoneFP)
+	delete(a.lastPresence, phoneFP)
 	nowEmpty := len(a.sessions) == 0
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
 	a.mu.Unlock()
 	fmt.Printf("TRUSTED session DOWN phone=%s\n", phoneFP)
+	a.recordEvent("device-trust-lost", "info", "Device trust ended", "Authenticated transport session ended.", phoneFP, nil)
 	if nowEmpty {
 		runHook(a.onUntrust)
 	}
@@ -737,10 +868,10 @@ func (a *Agent) pulseOwnerVisual() {
 	serial := strings.TrimSpace(a.adbSerial)
 	if serial == "" {
 		for s := range a.seenADB {
-			if serial != "" { // Ambiguous: never pulse the wrong device.
+			if serial != "" {
 				serial = ""
 				break
-			}
+			} // ambiguous: never pulse the wrong device
 			serial = s
 		}
 	}
@@ -831,6 +962,7 @@ func (a *Agent) adbSweep() {
 		a.mu.Unlock()
 		if first {
 			fmt.Printf("ADB device connected: %s; reverse=%v\n", serial, reverseOK)
+			a.recordEvent("transport-up", "info", "USB transport detected", fmt.Sprintf("ADB device %s; reverse=%v", serial, reverseOK), "", nil)
 		}
 		wake := false
 		visible := false
@@ -854,6 +986,7 @@ func (a *Agent) adbSweep() {
 			delete(a.seenADB, s)
 			delete(a.lastWake, s)
 			fmt.Printf("ADB device disconnected: %s\n", s)
+			a.recordEvent("transport-down", "info", "USB transport lost", "ADB device disconnected; trust will require a fresh authenticated session on recovery.", "", nil)
 		}
 	}
 	a.mu.Unlock()

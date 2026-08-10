@@ -106,12 +106,14 @@ func (a *Agent) authorize(action, resource string) controlResponse {
 	cfg := loadPolicy(a.stateDir)
 	d := evaluatePolicy(cfg, action, resource, trusted)
 	if !d.Allowed {
+		a.recordEvent("authority-denied", "warning", "Owner action denied", action+" -> "+resource+": "+d.Reason, "", nil)
 		return controlResponse{OK: true, Allowed: false, Reason: d.Reason}
 	}
 	if live == nil {
 		return controlResponse{OK: true, Allowed: false, Reason: "trusted session disappeared"}
 	}
 	if !present {
+		a.recordEvent("authority-denied", "info", "Owner action blocked while locked", action+" -> "+resource, live.phoneFP, nil)
 		return controlResponse{OK: true, Allowed: false, Reason: "owner presence required: phone is locked"}
 	}
 	ttl := 30
@@ -127,8 +129,10 @@ func (a *Agent) authorize(action, resource string) controlResponse {
 	select {
 	case r := <-pr.result:
 		if r.err != nil {
+			a.recordEvent("proof-error", "warning", "Owner proof failed", r.err.Error(), live.phoneFP, nil)
 			return controlResponse{Error: r.err.Error()}
 		}
+		a.recordEvent("proof-issued", "success", "Owner proof issued", action+" -> "+resource, live.phoneFP, nil)
 		return controlResponse{OK: true, Allowed: true, Reason: d.Reason, Proof: &r.proof}
 	case <-time.After(7 * time.Second):
 		return controlResponse{Error: "phone proof request timed out"}
