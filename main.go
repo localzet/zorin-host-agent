@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.6.0"
+	version      = "0.7.0"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"

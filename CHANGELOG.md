@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0
+- Suite version alignment for Zorin Trust 0.7.
+- Preserves the ZTRUST/2 owner-presence and explicit-approval policy surface used by Zorin Ops 0.2.
+- No signer migration and no phone re-pair are required when upgrading from the owner-managed signer line.
+
 ## 0.4.0
 - Event timeline journal (`events.jsonl`) for transport, trust, presence, pairing and proofs.
 - Human-readable Trust Center state in `status`.
