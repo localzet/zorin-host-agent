@@ -37,13 +37,22 @@ func TestPolicyV2MigrationAddsZAUTHScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != 5 {
-		t.Fatalf("expected policy v5, got %d", got.Version)
+	if got.Version != 6 {
+		t.Fatalf("expected policy v6, got %d", got.Version)
 	}
 	if !evaluatePolicy(got, "authority.authorize", "zauth:abcdef", true).Allowed {
 		t.Fatal("migrated policy must allow transaction-bound ZAUTH scopes")
 	}
 	if !evaluatePolicy(got, "authority.project.manage", "project:demo", true).Allowed {
 		t.Fatal("migrated policy must allow explicit Authority project management")
+	}
+	if !evaluatePolicy(got, "authority.ssh.issue", "sshcert:abcdef", true).Allowed {
+		t.Fatal("migrated policy must allow transaction-bound SSH certificate issuance")
+	}
+	if !evaluatePolicy(got, "ops.ssh-ca.enroll", "vps:prod", true).Allowed {
+		t.Fatal("migrated policy must allow explicit SSH CA enrollment")
+	}
+	if !evaluatePolicy(got, "ops.node.install", "vps:prod", true).Allowed {
+		t.Fatal("migrated policy must allow explicit Zorin Node installation")
 	}
 }

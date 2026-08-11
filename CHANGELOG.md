@@ -1,43 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- Added deny-by-default policy migration for phone-approved `ZSSH/1` OpenSSH certificate issuance.
+- Added explicit phone-approved policy scopes for Zorin Node installation and SSH CA enrollment.
+- Added SSH certificate policy documentation; direct legacy `credential.ssh` remains denied.
+
 ## 0.7.0
 - Suite version alignment for Zorin Trust 0.7.
 - Preserves the ZTRUST/2 owner-presence and explicit-approval policy surface used by Zorin Ops 0.2.
 - No signer migration and no phone re-pair are required when upgrading from the owner-managed signer line.
-
-## 0.4.0
-- Event timeline journal (`events.jsonl`) for transport, trust, presence, pairing and proofs.
-- Human-readable Trust Center state in `status`.
-- Pair verification phrase printed in pairing mode.
-- `host-info.json` snapshot for the Windows Trust Center.
-- Fixed ambiguous-device pulse selection code.
-
-## 0.3.4.1 tooling hotfix
-
-- Fix Windows Runtime owner-signing: do not feed the same one-line password file to both `--ks-pass` and `--key-pass`.
-- Reuse the keystore password for the PKCS#12 key by omitting `--key-pass`.
-- Refuse to silently replace a partially missing owner signer, preserving APK signing continuity.
-
-## 0.3.3
-
-- Persist an absolute ADB executable path for Scheduled Task startup.
-- Add daemon-health diagnostics and `doctor`.
-- Report ADB device/reverse/bootstrap failures instead of silently ignoring them.
-- Pair with Runtime 5.0.3, whose TrustService is isolated from the UI process.
-
-## 0.3.2
-
-- Persist the absolute adb executable path instead of relying on Scheduled Task PATH.
-- Add daemon-health.json with ADB device/reverse/service bootstrap health.
-- Add `doctor` diagnostics for ADB reverse and Android TrustService presence.
-- Decode Task Scheduler 0x00041306 in Windows status output.
-
-## 0.3.1
-- Headless reconnect remains service-only; the Activity is never started outside explicit pairing.
-- Increase failed headless bootstrap retry interval to 30s to prevent process-crash thrash.
-- Runtime 5.0.1 fixes the ART `VerifyError` that caused the v0.3 bootstrap loop.
-
-# Changelog
 
 ## 0.2.2
 - Keep cryptographic device trust alive while Android is locked.

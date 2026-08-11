@@ -29,13 +29,16 @@ type PolicyDecision struct {
 }
 
 func defaultPolicy() PolicyConfig {
-	return PolicyConfig{Version: 5, DefaultEffect: "deny", Rules: []PolicyRule{
+	return PolicyConfig{Version: 6, DefaultEffect: "deny", Rules: []PolicyRule{
 		{Action: "owner.session", Resource: "*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 30},
 		{Action: "owner.console", Resource: "local:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 30},
 		{Action: "credential.owner-proof", Resource: "*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
 		{Action: "authority.authorize", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
 		{Action: "authority.authorize", Resource: "zauth:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
 		{Action: "authority.project.manage", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "authority.ssh.issue", Resource: "sshcert:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "ops.ssh-ca.enroll", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+		{Action: "ops.node.install", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
 		{Action: "ops.terminal", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
 		{Action: "ops.docker.*", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
 		{Action: "ops.docker.*", Resource: "vps:*/container:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 45},
@@ -89,6 +92,17 @@ func ensurePolicy(stateDir string) (PolicyConfig, error) {
 					PolicyRule{Action: "authority.project.manage", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
 				)
 				cfg.Version = 5
+				changed = true
+			}
+			if cfg.Version < 6 {
+				// OpenSSH user certificates replace standing client credentials.
+				// Every certificate scope is still explicitly approved on the phone.
+				cfg.Rules = append(cfg.Rules,
+					PolicyRule{Action: "authority.ssh.issue", Resource: "sshcert:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+					PolicyRule{Action: "ops.ssh-ca.enroll", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+					PolicyRule{Action: "ops.node.install", Resource: "vps:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60},
+				)
+				cfg.Version = 6
 				changed = true
 			}
 			if changed {
