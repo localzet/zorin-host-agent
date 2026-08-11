@@ -1,9 +1,85 @@
 $ErrorActionPreference='Stop'
-$Here=Split-Path -Parent $MyInvocation.MyCommand.Path;$Repo=Split-Path -Parent $Here;$arch=$env:PROCESSOR_ARCHITECTURE;$bin=if($arch -eq 'ARM64'){'zorin-host-agent-windows-arm64.exe'}else{'zorin-host-agent-windows-amd64.exe'};$Exe=Join-Path $Repo (Join-Path 'dist' $bin);$TaskName='ZorinTrustHostAgent';$StateDir=Join-Path $env:APPDATA 'ZorinTrust'
-if(-not(Test-Path $Exe)){throw "Host agent not found: $Exe"};$AdbCmd=Get-Command adb.exe -ErrorAction SilentlyContinue;if($null-eq$AdbCmd){$AdbCmd=Get-Command adb -ErrorAction SilentlyContinue};if($null-eq$AdbCmd){throw 'adb is not in PATH.'};$AdbPath=$AdbCmd.Source;if(-not$AdbPath){$AdbPath=$AdbCmd.Path}
-$devices=@();& $AdbPath devices|Select-Object -Skip 1|ForEach-Object{$f=($_ -split '\s+')|Where-Object{$_};if($f.Count-ge2-and$f[1]-eq'device'){$devices+=$f[0]}};if($devices.Count-ne1){throw "Pairing expects exactly one authorized adb device; found $($devices.Count)."};$serial=$devices[0]
-$HadTask=$false;try{Import-Module ScheduledTasks -ErrorAction Stop;$Task=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;if($null-ne$Task){$HadTask=$true;Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue}}catch{}
-$pids=@();try{$pids=@(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 47472 -State Listen -ErrorAction Stop|Select-Object -ExpandProperty OwningProcess -Unique)}catch{};if($pids.Count-gt0){Write-Host "Temporarily stopping $($pids.Count) running agent process(es)..." -ForegroundColor Yellow;$pids|ForEach-Object{Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue};Start-Sleep -Milliseconds 300}
-Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue
-Write-Host "Starting one-time owner pairing window for $serial" -ForegroundColor Cyan;Write-Host 'The app will open. Open CENTER and compare the PAIR VERIFICATION code, then tap TRUST THIS WORKSTATION.';Write-Host 'Press Ctrl+C after TRUSTED session UP is confirmed.' -ForegroundColor DarkGray
-try{& $Exe daemon --pair-once --serial $serial --adb $AdbPath}finally{Remove-Item (Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;Remove-Item (Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue;if($HadTask){try{Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop;Write-Host 'Restored the autostart Zorin Host Agent.' -ForegroundColor Green}catch{Write-Warning "Could not restart autostart task: $($_.Exception.Message)"}}}
+$Here=Split-Path -Parent $MyInvocation.MyCommand.Path;
+$Repo=Split-Path -Parent $Here;
+$arch=$env:PROCESSOR_ARCHITECTURE;
+$bin=if($arch -eq 'ARM64') {
+    'zorin-host-agent-windows-arm64.exe'
+}
+else {
+    'zorin-host-agent-windows-amd64.exe'
+};
+$Exe=Join-Path $Repo(Join-Path 'dist' $bin);
+$TaskName='ZorinTrustHostAgent';
+$StateDir=Join-Path $env:APPDATA 'ZorinTrust'
+if(-not(Test-Path $Exe)) {
+    throw "Host agent not found: $Exe"
+};
+$AdbCmd=Get-Command adb.exe -ErrorAction SilentlyContinue;
+if($null-eq$AdbCmd) {
+    $AdbCmd=Get-Command adb -ErrorAction SilentlyContinue
+};
+if($null-eq$AdbCmd) {
+    throw 'adb is not in PATH.'
+};
+$AdbPath=$AdbCmd.Source;
+if(-not$AdbPath) {
+    $AdbPath=$AdbCmd.Path
+}
+$devices=@();
+& $AdbPath devices|Select-Object -Skip 1|ForEach-Object {
+    $f=($_ -split '\s+')|Where-Object {
+        $_
+    };
+    if($f.Count-ge2-and$f[1]-eq'device') {
+        $devices+=$f[0]
+    }
+};
+if($devices.Count-ne1) {
+    throw "Pairing expects exactly one authorized adb device; found $($devices.Count)."
+};
+$serial=$devices[0]
+$HadTask=$false;
+try {
+    Import-Module ScheduledTasks -ErrorAction Stop;
+    $Task=Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue;
+    if($null-ne$Task) {
+        $HadTask=$true;
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+}
+catch {
+}
+$pids=@();
+try {
+    $pids=@(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 47472 -State Listen -ErrorAction Stop|Select-Object -ExpandProperty OwningProcess -Unique)
+}
+catch {
+};
+if($pids.Count-gt0) {
+    Write-Host "Temporarily stopping $($pids.Count) running agent process(es)..." -ForegroundColor Yellow;
+    $pids|ForEach-Object {
+        Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+    };
+    Start-Sleep -Milliseconds 300
+}
+Remove-Item(Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;
+Remove-Item(Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue
+Write-Host "Starting one-time owner pairing window for $serial" -ForegroundColor Cyan;
+Write-Host 'The app will open. Open CENTER and compare the PAIR VERIFICATION code, then tap TRUST THIS WORKSTATION.';
+Write-Host 'Press Ctrl+C after TRUSTED session UP is confirmed.' -ForegroundColor DarkGray
+try {
+    & $Exe daemon --pair-once --serial $serial --adb $AdbPath
+}
+finally {
+    Remove-Item(Join-Path $StateDir 'session.json') -Force -ErrorAction SilentlyContinue;
+    Remove-Item(Join-Path $StateDir 'owner-mode.json') -Force -ErrorAction SilentlyContinue;
+    if($HadTask) {
+        try {
+            Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop;
+            Write-Host 'Restored the autostart Zorin Host Agent.' -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Could not restart autostart task: $($_.Exception.Message)"
+        }
+    }
+}

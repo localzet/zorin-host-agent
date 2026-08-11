@@ -55,7 +55,7 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 	if af["AUTH"] != "OK" {
 		t.Fatalf("auth failed: %#v", af)
 	}
-	// Wait until the host has promoted the authenticated connection to a live session.
+	// Ждём, пока хост поднимет аутентифицированное соединение до полноценной live-сессии.
 	deadline := time.Now().Add(time.Second)
 	for {
 		a.mu.Lock()
@@ -69,7 +69,7 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// Request authorization concurrently; it will queue until the next phone POLL.
+	// Запрашиваем авторизацию параллельно: запрос останется в очереди до следующего POLL телефона.
 	ch := make(chan controlResponse, 1)
 	go func() { ch <- a.authorize("owner.console", "local:test") }()
 	time.Sleep(20 * time.Millisecond)
@@ -110,7 +110,7 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 		t.Fatal("authorize timed out")
 	}
 
-	// Locking the phone must keep device trust alive but revoke user presence.
+	// Блокировка телефона должна сохранить device trust, но убрать присутствие владельца.
 	if err := writeLines(cli, "POLL LOCKED"); err != nil {
 		t.Fatal(err)
 	}

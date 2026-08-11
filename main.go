@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	version      = "0.9.0"
+	version      = "0.9.1"
 	listenAddr   = "127.0.0.1:47472"
 	controlAddr  = "127.0.0.1:47473"
 	androidPkg   = "dev.zorin.trustruntime"
@@ -331,7 +331,7 @@ func (a *Agent) recordEvent(kind, severity, title, detail, phone string, present
 		_, _ = f.Write(append(b, '\n'))
 		_ = f.Close()
 	}
-	// Bound the timeline file to ~512 KiB so a long-running workstation never grows it forever.
+	// Ограничиваем журнал примерно 512 KiB, чтобы на постоянно работающей машине он не рос бесконечно.
 	if st, err := os.Stat(p); err == nil && st.Size() > 512*1024 {
 		if data, err := os.ReadFile(p); err == nil {
 			start := len(data) / 2
@@ -434,6 +434,7 @@ func (a *Agent) saveConfig() error {
 type UIState struct {
 	Version          string    `json:"version"`
 	Updated          time.Time `json:"updated"`
+	DeviceAttached   bool      `json:"device_attached"`
 	DeviceTrusted    bool      `json:"device_trusted"`
 	OwnerPresent     bool      `json:"owner_present"`
 	AuthorityEnabled bool      `json:"authority_enabled"`
@@ -486,7 +487,8 @@ func (a *Agent) writeUIStateLocked(health *DaemonHealth) {
 		_ = json.Unmarshal(raw, &h)
 	}
 	if !h.Updated.IsZero() && time.Since(h.Updated) < 8*time.Second {
-		if len(h.Devices) > 0 && len(h.ReverseOK) > 0 {
+		st.DeviceAttached = len(h.Devices) > 0
+		if st.DeviceAttached && len(h.ReverseOK) > 0 {
 			st.TransportOnline = true
 			st.Transport = "USB"
 		} else if h.ADBAvailable {
@@ -835,7 +837,7 @@ func (a *Agent) sessionUp(live *liveSession) {
 	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
 	p := live.userPresent
 	a.recordEvent("device-trust", "success", "Device trust established", "Mutual ZTRUST/2 authentication succeeded.", live.phoneFP, &p)
-	// The red pulse is emitted only after mutual cryptographic authentication succeeds.
+	// Красный импульс показываем только после успешной взаимной криптографической аутентификации.
 	a.pulseOwnerVisual()
 	if wasEmpty {
 		runHook(a.onTrust)
@@ -1031,8 +1033,8 @@ func (a *Agent) startTrustService(serial string, pulse bool) error {
 }
 
 func (a *Agent) wakeAndroid(serial string, visible bool) error {
-	// Known hosts no longer wake the Activity. The foreground TrustService owns the
-	// persistent runtime and survives UI removal from Recents.
+	// Для уже известных хостов Activity больше не будим. Фоновый TrustService владеет
+	// постоянным runtime и переживает удаление UI из списка недавних приложений.
 	var startErr error
 	if err := a.startTrustService(serial, false); err != nil {
 		startErr = err
@@ -1058,7 +1060,7 @@ func (a *Agent) pulseOwnerVisual() {
 			if serial != "" {
 				serial = ""
 				break
-			} // ambiguous: never pulse the wrong device
+			} // неоднозначный выбор: никогда не подсвечиваем не то устройство
 			serial = s
 		}
 	}
@@ -1086,8 +1088,8 @@ func (a *Agent) shouldHeadlessWake(serial string, first bool) bool {
 	a.mu.Lock()
 	last := a.lastWake[serial]
 	a.mu.Unlock()
-	// A successful am start can still be followed by an app-side crash. Never hammer
-	// the package in a tight loop; a reconnect is immediate, in-session recovery is bounded.
+	// Даже после успешного am start приложение может упасть уже на своей стороне. Не долбим
+	// пакет в плотном цикле: переподключение делаем сразу, восстановление внутри сессии ограничиваем.
 	return time.Since(last) >= 30*time.Second
 }
 

@@ -2,7 +2,19 @@
   "version": 1,
   "default_effect": "deny",
   "rules": [
-    {"action":"owner.console","resource":"local:*","effect":"allow","require_trust":true,"proof_ttl_seconds":30},
-    {"action":"credential.ssh","resource":"server:staging-*","effect":"allow","require_trust":true,"proof_ttl_seconds":45}
+    {
+      "action": "owner.console",
+      "resource": "local:*",
+      "effect": "allow",
+      "require_trust": true,
+      "proof_ttl_seconds": 30
+    },
+    {
+      "action": "credential.ssh",
+      "resource": "server:staging-*",
+      "effect": "allow",
+      "require_trust": true,
+      "proof_ttl_seconds": 45
+    }
   ]
 }

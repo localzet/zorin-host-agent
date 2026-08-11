@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+- Publish physical ADB attachment independently from authenticated trust state.
+- Keep trust-session recovery and short ADB/ZTRUST flaps from looking like a new USB attachment to local consumers.
+- Full source-style maintenance: existing implementation notes are normalized to the project's Russian-comment convention.
+
 ## 0.9.0
 
 - Add policy-enforced `require_presence` and `require_explicit` semantics.
