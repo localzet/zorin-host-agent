@@ -57,7 +57,7 @@ function Get-ZorinSigningState {
         throw 'LOCALAPPDATA is not set'
     }
     $dir=Join-Path $env:LOCALAPPDATA 'ZorinTrust\signing'
-    [pscustomobject]@ {
+    [pscustomobject]@{
         Dir=$dir
         KeyStore=(Join-Path $dir 'runtime-owner.p12')
         PassFile=(Join-Path $dir 'runtime-owner.pass')

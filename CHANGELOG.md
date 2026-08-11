@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.2
+
+- Исправлен синтаксис `runtime-signing.ps1`, сломанный при форматировании PowerShell hashtable literal.
+- Версия Host Agent синхронизирована с maintenance-релизом Suite 0.9.2.
+
 ## 0.9.1
 
 - Publish physical ADB attachment independently from authenticated trust state.
