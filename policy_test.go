@@ -7,52 +7,100 @@ import (
 	"testing"
 )
 
-func TestPolicy(t *testing.T) {
+func TestDefaultPolicy(t *testing.T) {
 	cfg := defaultPolicy()
-	if !evaluatePolicy(cfg, "owner.console", "local:demo", true).Allowed {
-		t.Fatal("owner console should be allowed while trusted")
+	present := PolicyContext{Trusted: true, OwnerPresent: true}
+	locked := PolicyContext{Trusted: true, OwnerPresent: false}
+	offline := PolicyContext{}
+
+	if !evaluatePolicy(cfg, "owner.console", "local:demo", present).Allowed {
+		t.Fatal("owner console should be allowed with owner presence")
 	}
-	if evaluatePolicy(cfg, "owner.console", "local:demo", false).Allowed {
-		t.Fatal("owner console must require trust")
+	if evaluatePolicy(cfg, "owner.console", "local:demo", locked).Allowed {
+		t.Fatal("owner console should require presence")
 	}
-	if evaluatePolicy(cfg, "credential.ssh", "server:prod", true).Allowed {
-		t.Fatal("ssh must be denied by default")
+	if evaluatePolicy(cfg, "owner.console", "local:demo", offline).Allowed {
+		t.Fatal("owner console should require trust")
 	}
-	if !evaluatePolicy(cfg, "authority.authorize", "zauth:012345", true).Allowed {
-		t.Fatal("ZAUTH transaction scopes should be allowed while trusted")
+	if evaluatePolicy(cfg, "credential.ssh", "server:prod", present).Allowed {
+		t.Fatal("standing SSH credential should stay denied")
 	}
-	if !evaluatePolicy(cfg, "ops.docker.restart", "vps:prod/container:web", true).Allowed {
-		t.Fatal("Docker container resources should be allowed while trusted")
+
+	checks := []struct {
+		action   string
+		resource string
+	}{
+		{"authority.authorize", "zauth:012345"},
+		{"ops.docker.restart", "vps:prod/container:web"},
+		{"os.pam.authenticate", "user:ivan"},
+		{"os.sudo.authorize", "user:ivan"},
+		{"os.windows.sensitive", "local:settings"},
+	}
+
+	for _, check := range checks {
+		decision := evaluatePolicy(cfg, check.action, check.resource, locked)
+		if !decision.Allowed {
+			t.Fatalf("%s should be policy-allowed while explicit approval waits: %s", check.action, decision.Reason)
+		}
+		if !decision.RequireExplicit {
+			t.Fatalf("%s must force explicit approval", check.action)
+		}
 	}
 }
 
-func TestPolicyV2MigrationAddsZAUTHScope(t *testing.T) {
+func TestPolicyMigrationToV7(t *testing.T) {
 	dir := t.TempDir()
-	cfg := PolicyConfig{Version: 2, DefaultEffect: "deny", Rules: []PolicyRule{{Action: "authority.authorize", Resource: "project:*", Effect: "allow", RequireTrust: true, ProofTTLSeconds: 60}}}
-	b, _ := json.Marshal(cfg)
-	if err := os.WriteFile(filepath.Join(dir, "policy.json"), b, 0600); err != nil {
+	path := filepath.Join(dir, "policy.json")
+
+	old := PolicyConfig{
+		Version:       6,
+		DefaultEffect: "deny",
+		Rules: []PolicyRule{
+			{
+				Action:          "authority.ssh.issue",
+				Resource:        "sshcert:*",
+				Effect:          "allow",
+				RequireTrust:    true,
+				ProofTTLSeconds: 60,
+			},
+			{
+				Action:          "ops.terminal",
+				Resource:        "vps:*",
+				Effect:          "allow",
+				RequireTrust:    true,
+				ProofTTLSeconds: 45,
+			},
+		},
+	}
+
+	raw, err := json.Marshal(old)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
 	got, err := ensurePolicy(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != 6 {
-		t.Fatalf("expected policy v6, got %d", got.Version)
+	if got.Version != policyVersion {
+		t.Fatalf("version=%d want=%d", got.Version, policyVersion)
 	}
-	if !evaluatePolicy(got, "authority.authorize", "zauth:abcdef", true).Allowed {
-		t.Fatal("migrated policy must allow transaction-bound ZAUTH scopes")
+
+	sshDecision := evaluatePolicy(got, "authority.ssh.issue", "sshcert:abcdef", PolicyContext{Trusted: true})
+	if !sshDecision.Allowed || !sshDecision.RequireExplicit {
+		t.Fatal("migrated SSH issuance must force explicit approval")
 	}
-	if !evaluatePolicy(got, "authority.project.manage", "project:demo", true).Allowed {
-		t.Fatal("migrated policy must allow explicit Authority project management")
+
+	terminalDecision := evaluatePolicy(got, "ops.terminal", "vps:prod", PolicyContext{Trusted: true})
+	if terminalDecision.Allowed {
+		t.Fatal("migrated terminal rule must require owner presence")
 	}
-	if !evaluatePolicy(got, "authority.ssh.issue", "sshcert:abcdef", true).Allowed {
-		t.Fatal("migrated policy must allow transaction-bound SSH certificate issuance")
-	}
-	if !evaluatePolicy(got, "ops.ssh-ca.enroll", "vps:prod", true).Allowed {
-		t.Fatal("migrated policy must allow explicit SSH CA enrollment")
-	}
-	if !evaluatePolicy(got, "ops.node.install", "vps:prod", true).Allowed {
-		t.Fatal("migrated policy must allow explicit Zorin Node installation")
+
+	pamDecision := evaluatePolicy(got, "os.pam.authenticate", "user:ivan", PolicyContext{Trusted: true})
+	if !pamDecision.Allowed || !pamDecision.RequireExplicit {
+		t.Fatal("PAM rule was not added during migration")
 	}
 }

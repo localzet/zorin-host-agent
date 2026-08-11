@@ -25,11 +25,20 @@ type controlRequest struct {
 }
 
 type controlResponse struct {
-	OK      bool        `json:"ok"`
-	Allowed bool        `json:"allowed,omitempty"`
-	Reason  string      `json:"reason,omitempty"`
-	Proof   *OwnerProof `json:"proof,omitempty"`
-	Error   string      `json:"error,omitempty"`
+	OK      bool           `json:"ok"`
+	Allowed bool           `json:"allowed,omitempty"`
+	Reason  string         `json:"reason,omitempty"`
+	Proof   *OwnerProof    `json:"proof,omitempty"`
+	Status  *controlStatus `json:"status,omitempty"`
+	Error   string         `json:"error,omitempty"`
+}
+
+type controlStatus struct {
+	Trusted          bool   `json:"trusted"`
+	OwnerPresent     bool   `json:"owner_present"`
+	HostFingerprint  string `json:"host_fingerprint"`
+	PhoneFingerprint string `json:"phone_fingerprint,omitempty"`
+	IdentityProvider string `json:"identity_provider"`
 }
 
 func (a *Agent) serveControl() error {
@@ -49,8 +58,8 @@ func (a *Agent) serveControl() error {
 
 func (a *Agent) handleControl(c net.Conn) {
 	defer c.Close()
-	// Explicit phone approvals are deliberately human-paced. Keep the local
-	// control connection bounded, but long enough for unlock + confirmation.
+	// Явное подтверждение на телефоне — намеренно «человеческая» операция.
+	// Таймаут оставляем ограниченным, но достаточным для разблокировки и тапа.
 	_ = c.SetDeadline(time.Now().Add(75 * time.Second))
 	var req controlRequest
 	if err := json.NewDecoder(c).Decode(&req); err != nil {
@@ -66,26 +75,46 @@ func (a *Agent) handleControl(c net.Conn) {
 		resp := a.authorizeDetailed(req.Action, req.Resource, req.Prompt, req.RequestID, req.Explicit)
 		_ = json.NewEncoder(c).Encode(resp)
 	case "status":
-		a.mu.Lock()
-		trusted := len(a.live) > 0
-		present := false
-		for _, s := range a.live {
-			if s.userPresent {
-				present = true
-				break
-			}
-		}
-		a.mu.Unlock()
+		status := a.controlStatus()
 		reason := "no trusted device session"
-		if trusted && present {
+		if status.Trusted && status.OwnerPresent {
 			reason = "trusted device + owner presence"
-		} else if trusted {
+		} else if status.Trusted {
 			reason = "trusted device; phone locked"
 		}
-		_ = json.NewEncoder(c).Encode(controlResponse{OK: true, Allowed: trusted, Reason: reason})
+		_ = json.NewEncoder(c).Encode(controlResponse{
+			OK:      true,
+			Allowed: status.Trusted,
+			Reason:  reason,
+			Status:  &status,
+		})
 	default:
 		_ = json.NewEncoder(c).Encode(controlResponse{Error: "unsupported control operation"})
 	}
+}
+
+func (a *Agent) controlStatus() controlStatus {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	status := controlStatus{
+		Trusted:          len(a.live) > 0,
+		HostFingerprint:  a.hostFP,
+		IdentityProvider: a.identity.Provider(),
+	}
+
+	for _, session := range a.live {
+		if status.PhoneFingerprint == "" {
+			status.PhoneFingerprint = session.phoneFP
+		}
+		if session.userPresent {
+			status.OwnerPresent = true
+			status.PhoneFingerprint = session.phoneFP
+			break
+		}
+	}
+
+	return status
 }
 
 func (a *Agent) authorize(action, resource string) controlResponse {
@@ -123,7 +152,10 @@ func (a *Agent) authorizeDetailed(action, resource, prompt, requestID string, ex
 	a.mu.Unlock()
 
 	cfg := loadPolicy(a.stateDir)
-	d := evaluatePolicy(cfg, action, resource, trusted)
+	d := evaluatePolicy(cfg, action, resource, PolicyContext{
+		Trusted:      trusted,
+		OwnerPresent: present,
+	})
 	if !d.Allowed {
 		a.recordEvent("authority-denied", "warning", "Action denied", action+" -> "+resource+": "+d.Reason, "", nil)
 		return controlResponse{OK: true, Allowed: false, Reason: d.Reason}
@@ -131,13 +163,10 @@ func (a *Agent) authorizeDetailed(action, resource, prompt, requestID string, ex
 	if live == nil {
 		return controlResponse{OK: true, Allowed: false, Reason: "trusted session disappeared"}
 	}
-	// Presence-only grants remain instant. Explicit grants are allowed to wait
-	// while the phone is locked; the phone itself refuses to sign until it is
-	// unlocked and the user taps Authorize.
-	if !explicit && !present {
-		a.recordEvent("authority-denied", "info", "Action paused while phone is locked", action+" -> "+resource, live.phoneFP, nil)
-		return controlResponse{OK: true, Allowed: false, Reason: "owner presence required: phone is locked"}
-	}
+
+	// Клиент может попросить более строгий режим, но ослабить правило policy
+	// он не может. Для чувствительных действий explicit включается здесь.
+	explicit = explicit || d.RequireExplicit
 
 	ttl := 30
 	if d.Rule != nil && d.Rule.ProofTTLSeconds > 0 {

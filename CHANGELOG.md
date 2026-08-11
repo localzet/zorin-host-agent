@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- Add policy-enforced `require_presence` and `require_explicit` semantics.
+- Add PAM, sudo and Windows native sensitive-action policy scopes.
+- Return structured local trust state from the authenticated control API.
+- Keep explicit approvals able to wait for phone unlock while presence-only grants remain immediate.
+- Format changed Go source and use Russian comments for internal implementation notes.
+
 ## 0.8.0
 
 - Added deny-by-default policy migration for phone-approved `ZSSH/1` OpenSSH certificate issuance.
