@@ -25,13 +25,13 @@ import (
 )
 
 const (
-	version      = "0.9.3"
-	listenAddr   = "127.0.0.1:47472"
-	controlAddr  = "127.0.0.1:47473"
-	androidPkg   = "dev.zorin.trustruntime"
-	androidAct   = "android.app.NativeActivity"
-	androidSvc   = "dev.zorin.trustruntime.TrustService"
-	protocolName = "ZTRUST/2"
+	version            = "0.10.0"
+	defaultListenAddr  = "127.0.0.1:47472"
+	defaultControlAddr = "127.0.0.1:47473"
+	androidPkg         = "dev.zorin.trustruntime"
+	androidAct         = "android.app.NativeActivity"
+	androidSvc         = "dev.zorin.trustruntime.TrustService"
+	protocolName       = "ZTRUST/2"
 )
 
 type Config struct {
@@ -69,6 +69,8 @@ type Session struct {
 	Policy               string    `json:"policy"`
 	HostIdentityProvider string    `json:"host_identity_provider"`
 	UserPresent          bool      `json:"user_present"`
+	Transport            string    `json:"transport,omitempty"`
+	RemoteAddr           string    `json:"remote_addr,omitempty"`
 }
 
 type proofRequest struct {
@@ -89,23 +91,31 @@ type liveSession struct {
 	phoneDER    []byte
 	req         chan proofRequest
 	userPresent bool
+	transport   string
+	remoteAddr  string
 }
 
 type Agent struct {
-	identity     HostIdentity
-	hostPub      []byte
-	hostFP       string
-	cfg          Config
-	cfgPath      string
-	stateDir     string
-	pairOnce     bool
-	onTrust      string
-	onUntrust    string
-	onPresence   string
-	onAbsence    string
-	adbSerial    string
-	adbPath      string
-	controlToken string
+	identity        HostIdentity
+	hostPub         []byte
+	hostFP          string
+	cfg             Config
+	cfgPath         string
+	stateDir        string
+	pairOnce        bool
+	onTrust         string
+	onUntrust       string
+	onPresence      string
+	onAbsence       string
+	adbSerial       string
+	adbPath         string
+	controlToken    string
+	listenAddr      string
+	controlAddr     string
+	portable        bool
+	portableInvite  string
+	portableExpires time.Time
+	persistState    bool
 
 	mu           sync.Mutex
 	eventMu      sync.Mutex
@@ -123,6 +133,13 @@ func main() {
 		cmd = args[0]
 		args = args[1:]
 	}
+	if cmd == "portable" {
+		if err := runPortable(args); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
 	a, err := loadAgent()
 	if err != nil {
 		fatal(err)
@@ -140,6 +157,8 @@ func main() {
 		noADB := fs.Bool("no-adb-watch", false, "listen only; do not configure adb reverse or wake the Android app")
 		serial := fs.String("serial", "", "limit ADB watcher to one device serial (adb -s <serial>)")
 		adbPath := fs.String("adb", "", "absolute path to adb executable; persisted for autostart reliability")
+		trustListen := fs.String("listen", defaultListenAddr, "ZTRUST listener; non-loopback requires --allow-direct")
+		allowDirect := fs.Bool("allow-direct", false, "allow ZTRUST connections from non-loopback network interfaces")
 		_ = fs.Parse(args)
 		a.pairOnce = *pairOnce
 		a.onTrust = *onTrust
@@ -147,13 +166,20 @@ func main() {
 		a.onPresence = *onPresence
 		a.onAbsence = *onAbsence
 		a.adbSerial = strings.TrimSpace(*serial)
+		a.listenAddr = strings.TrimSpace(*trustListen)
+		if a.listenAddr == "" {
+			fatal(errors.New("--listen cannot be empty"))
+		}
+		if !*allowDirect && !isLoopbackListener(a.listenAddr) {
+			fatal(errors.New("non-loopback --listen requires explicit --allow-direct"))
+		}
 		if err := a.configureADB(strings.TrimSpace(*adbPath)); err != nil {
 			fmt.Fprintf(os.Stderr, "ADB unavailable: %v\n", err)
 		}
 		fmt.Printf("Zorin Host Agent %s\n", version)
 		fmt.Printf("Host identity: %s\n", a.hostFP)
 		fmt.Printf("Identity provider: %s\n", a.identity.Provider())
-		fmt.Printf("Trust listen: %s\nControl API: %s\n", listenAddr, controlAddr)
+		fmt.Printf("Trust listen: %s\nControl API: %s\n", a.listenAddr, a.controlAddr)
 		if a.adbPath != "" {
 			fmt.Printf("ADB executable: %s\n", a.adbPath)
 		} else {
@@ -213,7 +239,7 @@ func main() {
 	case "version":
 		fmt.Println(version)
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|status|ui-state|doctor|authorize|credential|gate|policy|identity|device|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "Usage: %s [daemon|portable|status|ui-state|doctor|authorize|credential|gate|policy|identity|device|fingerprint|unpair-all|version] [options]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 }
@@ -248,7 +274,24 @@ func loadAgent() (*Agent, error) {
 		return nil, err
 	}
 	_, _ = ensurePolicy(stateDir)
-	return &Agent{identity: id, hostPub: pub, hostFP: id.Fingerprint(), cfg: cfg, cfgPath: cfgPath, stateDir: stateDir, adbPath: strings.TrimSpace(cfg.ADBPath), controlToken: token, sessions: map[string]Session{}, live: map[string]*liveSession{}, seenADB: map[string]bool{}, lastWake: map[string]time.Time{}, lastPresence: map[string]bool{}}, nil
+	return &Agent{
+		identity:     id,
+		hostPub:      pub,
+		hostFP:       id.Fingerprint(),
+		cfg:          cfg,
+		cfgPath:      cfgPath,
+		stateDir:     stateDir,
+		adbPath:      strings.TrimSpace(cfg.ADBPath),
+		controlToken: token,
+		listenAddr:   defaultListenAddr,
+		controlAddr:  defaultControlAddr,
+		persistState: true,
+		sessions:     map[string]Session{},
+		live:         map[string]*liveSession{},
+		seenADB:      map[string]bool{},
+		lastWake:     map[string]time.Time{},
+		lastPresence: map[string]bool{},
+	}, nil
 }
 
 func (a *Agent) configureADB(explicit string) error {
@@ -458,7 +501,14 @@ func (a *Agent) anyPresentLocked() bool {
 }
 
 func (a *Agent) writeUIStateLocked(health *DaemonHealth) {
-	st := UIState{Version: version, Updated: time.Now(), HostFingerprint: a.hostFP, IdentityProvider: a.identity.Provider(), PairVerification: pairCodeFromFingerprint(a.hostFP), Transport: "Offline"}
+	st := UIState{
+		Version:          version,
+		Updated:          time.Now(),
+		HostFingerprint:  a.hostFP,
+		IdentityProvider: a.identity.Provider(),
+		PairVerification: pairCodeFromFingerprint(a.hostFP),
+		Transport:        "Offline",
+	}
 	var newest Session
 	for _, s := range a.sessions {
 		if s.Trusted {
@@ -473,6 +523,11 @@ func (a *Agent) writeUIStateLocked(health *DaemonHealth) {
 	}
 	st.AuthorityEnabled = st.DeviceTrusted && st.OwnerPresent
 	if !newest.LastSeen.IsZero() {
+		st.DeviceAttached = true
+		st.TransportOnline = true
+		if newest.Transport != "" {
+			st.Transport = newest.Transport
+		}
 		st.PhoneFingerprint = newest.PhoneFingerprint
 		st.LastSeen = newest.LastSeen
 		st.PhoneLabel = a.cfg.DeviceLabels[newest.PhoneFingerprint]
@@ -486,7 +541,7 @@ func (a *Agent) writeUIStateLocked(health *DaemonHealth) {
 	} else if raw, err := os.ReadFile(filepath.Join(a.stateDir, "daemon-health.json")); err == nil {
 		_ = json.Unmarshal(raw, &h)
 	}
-	if !h.Updated.IsZero() && time.Since(h.Updated) < 8*time.Second {
+	if !st.TransportOnline && !h.Updated.IsZero() && time.Since(h.Updated) < 8*time.Second {
 		st.DeviceAttached = len(h.Devices) > 0
 		if st.DeviceAttached && len(h.ReverseOK) > 0 {
 			st.TransportOnline = true
@@ -523,12 +578,16 @@ func (a *Agent) printStatus() {
 	}
 
 	trusted, present := false, false
+	activeTransport := ""
 	var sessions []Session
 	if raw, err := os.ReadFile(filepath.Join(a.stateDir, "session.json")); err == nil {
 		_ = json.Unmarshal(raw, &sessions)
 		for _, ss := range sessions {
 			if ss.Trusted {
 				trusted = true
+				if activeTransport == "" && ss.Transport != "" {
+					activeTransport = ss.Transport
+				}
 			}
 			if ss.UserPresent {
 				present = true
@@ -544,7 +603,9 @@ func (a *Agent) printStatus() {
 	}
 	transport := healthFresh && len(health.Devices) > 0 && len(health.ReverseOK) > 0
 	transportText := "OFFLINE"
-	if transport {
+	if activeTransport != "" {
+		transportText = activeTransport
+	} else if transport {
 		transportText = "USB / ADB"
 	} else if healthFresh && health.ADBAvailable {
 		transportText = "RECOVERING"
@@ -573,7 +634,7 @@ func (a *Agent) printStatus() {
 	fmt.Printf("  Pair code:      %s\n", pairCodeFromFingerprint(a.hostFP))
 
 	fmt.Printf("\nPolicy: %s\n", filepath.Join(a.stateDir, "policy.json"))
-	fmt.Printf("Control API: %s (token file protected in state dir)\n", controlAddr)
+	fmt.Printf("Control API: %s (token file protected in state dir)\n", a.controlAddr)
 	if a.adbPath != "" {
 		fmt.Printf("ADB executable: %s\n", a.adbPath)
 	} else {
@@ -595,10 +656,10 @@ func (a *Agent) printStatus() {
 }
 
 func (a *Agent) serve() error {
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := net.Listen("tcp", a.listenAddr)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "address already in use") || strings.Contains(strings.ToLower(err.Error()), "only one usage") {
-			return fmt.Errorf("another Zorin Host Agent is already listening on %s; stop/restart it or use the pairing script: %w", listenAddr, err)
+			return fmt.Errorf("another Zorin Host Agent is already listening on %s; stop/restart it or use the pairing script: %w", a.listenAddr, err)
 		}
 		return err
 	}
@@ -619,6 +680,40 @@ func randomHex(n int) string {
 	}
 	return hex.EncodeToString(b)
 }
+
+func connectionTransport(addr net.Addr) string {
+	if addr == nil {
+		return "Unknown"
+	}
+
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		host = addr.String()
+	}
+
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip != nil && ip.IsLoopback() {
+		return "USB / ADB"
+	}
+
+	return "Direct LAN"
+}
+
+func isLoopbackListener(addr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return false
+	}
+
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func writeLines(w io.Writer, lines ...string) error {
 	for _, s := range lines {
 		if _, err := io.WriteString(w, s+"\n"); err != nil {
@@ -658,6 +753,11 @@ func hostProofMessage(hostNonce, phoneNonce, hostPubHex, phonePubHex string) []b
 
 func (a *Agent) handle(c net.Conn) {
 	defer c.Close()
+	transport := connectionTransport(c.RemoteAddr())
+	remoteAddr := ""
+	if c.RemoteAddr() != nil {
+		remoteAddr = c.RemoteAddr().String()
+	}
 	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
 	hostNonce := randomHex(32)
 	hostPubHex := hex.EncodeToString(a.hostPub)
@@ -673,6 +773,19 @@ func (a *Agent) handle(c net.Conn) {
 	if err != nil {
 		return
 	}
+	if a.portable {
+		if !a.portableExpires.IsZero() && time.Now().After(a.portableExpires) {
+			_ = writeLines(c, "AUTH FAIL portable-invite-expired", "END")
+			return
+		}
+
+		invite := strings.TrimSpace(f["INVITE"])
+		if invite == "" || invite != a.portableInvite {
+			_ = writeLines(c, "AUTH FAIL portable-invite", "END")
+			return
+		}
+	}
+
 	phonePubHex, phoneNonce, phoneSigHex := f["PHONE_PUB"], f["PHONE_NONCE"], f["PHONE_SIG"]
 	phoneState := f["PHONE_STATE"]
 	initialPresence := !strings.EqualFold(phoneState, "LOCKED")
@@ -739,7 +852,14 @@ func (a *Agent) handle(c net.Conn) {
 		return
 	}
 	_ = c.SetDeadline(time.Time{})
-	live := &liveSession{phoneFP: phoneFP, phoneDER: append([]byte(nil), phoneDER...), req: make(chan proofRequest, 8), userPresent: initialPresence}
+	live := &liveSession{
+		phoneFP:     phoneFP,
+		phoneDER:    append([]byte(nil), phoneDER...),
+		req:         make(chan proofRequest, 8),
+		userPresent: initialPresence,
+		transport:   transport,
+		remoteAddr:  remoteAddr,
+	}
 	a.sessionUp(live)
 	defer a.sessionDown(phoneFP)
 	for {
@@ -828,13 +948,24 @@ func (a *Agent) sessionUp(live *liveSession) {
 	wasPresent := a.anyPresentLocked()
 	now := time.Now()
 	a.live[live.phoneFP] = live
-	a.sessions[live.phoneFP] = Session{Trusted: true, HostFingerprint: a.hostFP, PhoneFingerprint: live.phoneFP, Since: now, LastSeen: now, Policy: "owner-workstation", HostIdentityProvider: a.identity.Provider(), UserPresent: live.userPresent}
+	a.sessions[live.phoneFP] = Session{
+		Trusted:              true,
+		HostFingerprint:      a.hostFP,
+		PhoneFingerprint:     live.phoneFP,
+		Since:                now,
+		LastSeen:             now,
+		Policy:               "owner-workstation",
+		HostIdentityProvider: a.identity.Provider(),
+		UserPresent:          live.userPresent,
+		Transport:            live.transport,
+		RemoteAddr:           live.remoteAddr,
+	}
 	a.writeSessionLocked()
 	a.writeOwnerModeLocked()
 	a.writeUIStateLocked(nil)
 	nowPresent := a.anyPresentLocked()
 	a.mu.Unlock()
-	fmt.Printf("TRUSTED session UP phone=%s\n", live.phoneFP)
+	fmt.Printf("TRUSTED session UP phone=%s transport=%s remote=%s\n", live.phoneFP, live.transport, live.remoteAddr)
 	p := live.userPresent
 	a.recordEvent("device-trust", "success", "Device trust established", "Mutual ZTRUST/2 authentication succeeded.", live.phoneFP, &p)
 	// Красный импульс показываем только после успешной взаимной криптографической аутентификации.

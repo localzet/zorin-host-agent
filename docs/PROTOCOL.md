@@ -1,6 +1,6 @@
 # ZTRUST/2
 
-Stock-phone transport is TCP `127.0.0.1:47472` reached through `adb reverse`.
+`ZTRUST/2` authenticates the byte stream, not a specific transport. Normal workstation mode reaches TCP `127.0.0.1:47472` through `adb reverse`; portable 0.10 can expose the same listener directly on an explicitly enabled private LAN endpoint.
 
 ## Authentication
 

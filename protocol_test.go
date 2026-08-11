@@ -129,4 +129,20 @@ func TestZTrust2OwnerProofFlow(t *testing.T) {
 		t.Fatalf("locked phone should deny owner proof: %#v", resp)
 	}
 	_ = writeLines(cli, "BYE")
+
+	// Дожидаемся sessionDown, чтобы goroutine не писала state-файлы уже после
+	// cleanup временного каталога теста.
+	deadline = time.Now().Add(time.Second)
+	for {
+		a.mu.Lock()
+		live := len(a.live)
+		a.mu.Unlock()
+		if live == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live session did not shut down")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

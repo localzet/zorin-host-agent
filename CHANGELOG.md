@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0
+
+- Отвязать `ZTRUST/2` от обязательного ADB-транспорта: штатный daemon остаётся loopback-only, а прямой listener требует явного opt-in.
+- Добавить `portable` режим с одноразовой P-256 identity, временной bootstrap-страницей и private-LAN deep link для Android Runtime.
+- Не сохранять portable workstation identity и paired-phone state после завершения процесса.
+- Добавить policy v8 scope `portable.session / host:*` с обязательным явным подтверждением телефона.
+- Добавить `--proof-out` для выдачи короткоживущего `ZOWNER/1` proof временной рабочей станции.
+
 ## 0.9.3
 
 - Исправлен Windows PowerShell 5.1 pipeline в `scripts/status.ps1`, повреждённый предыдущим multiline-форматированием.

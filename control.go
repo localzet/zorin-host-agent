@@ -42,7 +42,7 @@ type controlStatus struct {
 }
 
 func (a *Agent) serveControl() error {
-	ln, err := net.Listen("tcp", controlAddr)
+	ln, err := net.Listen("tcp", a.controlAddr)
 	if err != nil {
 		return err
 	}
@@ -254,7 +254,7 @@ func (a *Agent) currentADBDevices() []string {
 
 func requestControl(a *Agent, req controlRequest) (controlResponse, error) {
 	req.Token = a.controlToken
-	c, err := net.DialTimeout("tcp", controlAddr, 2*time.Second)
+	c, err := net.DialTimeout("tcp", a.controlAddr, 2*time.Second)
 	if err != nil {
 		return controlResponse{}, fmt.Errorf("host agent control API is not running: %w", err)
 	}

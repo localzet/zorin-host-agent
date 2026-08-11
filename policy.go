@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const policyVersion = 7
+const policyVersion = 8
 
 type PolicyRule struct {
 	Action          string `json:"action"`
@@ -62,6 +62,14 @@ func defaultPolicy() PolicyConfig {
 			{
 				Action:          "credential.owner-proof",
 				Resource:        "*",
+				Effect:          "allow",
+				RequireTrust:    true,
+				RequireExplicit: true,
+				ProofTTLSeconds: 60,
+			},
+			{
+				Action:          "portable.session",
+				Resource:        "host:*",
 				Effect:          "allow",
 				RequireTrust:    true,
 				RequireExplicit: true,
@@ -293,7 +301,7 @@ func migratePolicy(cfg *PolicyConfig) bool {
 		changed = true
 	}
 
-	if cfg.Version < policyVersion {
+	if cfg.Version < 7 {
 		// Начиная с 0.9 степень подтверждения задаёт policy, а не вызывающий
 		// клиент. Так чувствительный вызов нельзя случайно ослабить, забыв
 		// передать explicit=true.
@@ -337,6 +345,22 @@ func migratePolicy(cfg *PolicyConfig) bool {
 			},
 		)
 
+		cfg.Version = 7
+		changed = true
+	}
+
+	if cfg.Version < policyVersion {
+		// Portable-host не получает постоянного доверия. Proof нужен именно как
+		// короткоживущая capability, которую можно передать следующему локальному
+		// инструменту без сохранения ключа временной рабочей станции.
+		cfg.Rules = append(cfg.Rules, PolicyRule{
+			Action:          "portable.session",
+			Resource:        "host:*",
+			Effect:          "allow",
+			RequireTrust:    true,
+			RequireExplicit: true,
+			ProofTTLSeconds: 60,
+		})
 		cfg.Version = policyVersion
 		changed = true
 	}

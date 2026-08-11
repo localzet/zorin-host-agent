@@ -43,6 +43,46 @@ func (i *legacyIdentity) SignDigest(d []byte) ([]byte, error) {
 	return ecdsa.SignASN1(rand.Reader, i.key, d)
 }
 
+type ephemeralIdentity struct {
+	key *ecdsa.PrivateKey
+	der []byte
+	fp  string
+}
+
+func (i *ephemeralIdentity) PublicDER() []byte {
+	return append([]byte(nil), i.der...)
+}
+
+func (i *ephemeralIdentity) Fingerprint() string {
+	return i.fp
+}
+
+func (i *ephemeralIdentity) Provider() string {
+	return "portable/ephemeral"
+}
+
+func (i *ephemeralIdentity) SignDigest(digest []byte) ([]byte, error) {
+	return ecdsa.SignASN1(rand.Reader, i.key, digest)
+}
+
+func newEphemeralIdentity() (HostIdentity, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ephemeralIdentity{
+		key: key,
+		der: der,
+		fp:  fingerprint(der),
+	}, nil
+}
+
 func fingerprint(der []byte) string {
 	h := sha256.Sum256(der)
 	s := strings.ToUpper(hex.EncodeToString(h[:16]))
