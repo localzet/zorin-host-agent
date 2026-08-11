@@ -48,10 +48,13 @@ try {
 catch {
 }
 if($ids.Count -eq 0) {
-    $ids = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.ProcessName -like 'zorin-host-agent*'
-    }
-    | Select-Object -ExpandProperty Id)
+    $ids = @(
+        Get-Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProcessName -like 'zorin-host-agent*'
+            } |
+            Select-Object -ExpandProperty Id
+    )
 }
 if($ids.Count -eq 0) {
     Write-Host 'Agent process: NOT RUNNING' -ForegroundColor Yellow

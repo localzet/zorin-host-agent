@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.3
+
+- Исправлен Windows PowerShell 5.1 pipeline в `scripts/status.ps1`, повреждённый предыдущим multiline-форматированием.
+- Добавлена дополнительная проверка совместимости PowerShell-исходников перед упаковкой Suite.
+- Версия Host Agent синхронизирована с maintenance-релизом Suite 0.9.3.
+
 ## 0.9.2
 
 - Исправлен синтаксис `runtime-signing.ps1`, сломанный при форматировании PowerShell hashtable literal.
